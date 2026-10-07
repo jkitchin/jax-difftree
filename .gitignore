@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Third-party papers (no redistribution rights)
+end to end learning of decision trees and forests.pdf
+recent advances in dts.pdf
+
+# LaTeX / org export artifacts
+README.tex
+README.pdf
+*.bbl
+*.blg
+*.synctex.gz
+*.minted
+_minted*/

@@ -1,0 +1,242 @@
+#+TITLE: difftree: differentiable decision trees in JAX with built-in UQ
+#+AUTHOR: J. R. Kitchin
+#+OPTIONS: toc:nil
+
+* TODO followup on difftree
+DEADLINE: <2026-10-14 Wed +1w>
+
+* Overview
+
+~difftree~ is a JAX implementation of soft, oblique-split, gradient-trainable
+decision trees with sklearn-compatible estimators. The package is built around
+uncertainty quantification: regression leaves are heteroscedastic Gaussians (or
+multivariate Gaussians for multi-output targets), and the predictive
+distribution at each input is a mixture of Gaussians weighted by soft path
+probabilities. This structure delivers a calibrated predictive variance, a
+clean decomposition of uncertainty into within-leaf (aleatoric) and
+between-leaf (routing) components, and, for multivariate outputs, closed-form
+cross-conditioning and gradient-based inverse design as direct consequences.
+
+The implementation is closest in spirit to the end-to-end deterministic-tree
+formulation of cite:hehn2020end, with two practical departures motivated by
+UQ. First, splits are kept finitely soft at test time rather than annealed to
+hard, so soft-routing uncertainty contributes to the predictive variance.
+Second, a small post-hoc calibration step, in the same family as temperature
+scaling for classifier logits cite:guo2017calibration, jointly fits per-depth
+steepness and a scalar variance correction on a held-out validation slice by
+minimizing NLL.
+
+The broader design space is reviewed in Ref. citenum:costa2023recent.
+
+* Why differentiable trees
+
+Traditional decision trees cite:breiman1984cart,quinlan1986induction grow
+greedily and use hard, axis-aligned splits, which prevents joint optimization
+of the whole tree and limits the splits to one feature at a time. Several
+related lines of work make trees differentiable in some form:
+
+- Deep Neural Decision Forests cite:kontschieder2015deep wrap a probabilistic routing tree around a deep feature extractor, but inference still evaluates every leaf for every sample, defeating the conditional-data-flow advantage of trees.
+- Soft decision trees distilled from neural networks cite:frosst2017distilling and adaptive neural trees cite:tanno2019adaptive retain soft routing throughout, and do not target calibrated uncertainty directly.
+- Ref. citenum:hehn2020end propose end-to-end training of trees by annealing the steepness $\gamma$ during training so that the final inference model is hard (single root-to-leaf path per sample) while training remains differentiable. This recovers the tree's $O(\log L)$ inference cost.
+
+For UQ, the issue with annealing $\gamma \to \infty$ is that the soft-routing
+component of predictive uncertainty is destroyed. ~difftree~ keeps $\gamma$
+finite at test time and exposes the routing component explicitly, while still
+supporting hard inference for users who want fast point predictions.
+
+Non-greedy oblique training generally has been a productive direction
+cite:norouzi2015efficient,murthy1994system, and the soft-routing formulation
+fits naturally inside it.
+
+* Installation
+
+#+begin_example
+git clone <repo>
+cd trees
+uv sync
+#+end_example
+
+The package depends on ~jax~, ~optax~, ~scikit-learn~, and ~numpy~.
+
+* Quickstart
+
+** Univariate regression
+
+#+begin_example
+from difftree import DifferentiableTreeRegressor
+from sklearn.datasets import make_friedman1
+from sklearn.model_selection import train_test_split
+
+X, y = make_friedman1(n_samples=600, noise=1.0, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=100, random_state=0)
+
+model = DifferentiableTreeRegressor(depth=5, n_epochs=150, random_state=0)
+model.fit(X_tr, y_tr)
+
+mean = model.predict(X_te)
+mean, std = model.predict(X_te, return_std=True)
+mean, std, std_aleatoric, std_routing = model.predict(X_te, return_components=True)
+samples = model.sample_y(X_te, n_samples=200)
+q05, q50, q95 = model.predict_quantile(X_te, q=[0.05, 0.5, 0.95])
+#+end_example
+
+** Multivariate regression with cross-conditioning
+
+#+begin_example
+import numpy as np
+model = DifferentiableTreeRegressor(depth=5, n_epochs=150).fit(X_tr, Y_tr)
+
+# Joint mean and full predictive covariance
+mean, cov = model.predict_full_cov(X_te)
+
+# Conditional p(y_unobs | x, y_obs) in closed form
+cond_mean, cond_cov, log_evidence = model.predict_conditional(
+    X_te, observed={0: Y_te[:, 0]}
+)
+cond_samples = model.sample_y_conditional(
+    X_te, observed={0: Y_te[:, 0]}, n_samples=500
+)
+#+end_example
+
+** Inverse design
+
+Optimize the input vector to maximize the log-likelihood of a target
+multivariate output, with optional partial constraints and feature-box bounds:
+
+#+begin_example
+x_best, log_lik, x_all, log_liks = model.inverse_design(
+    targets={0: 1.8, 1: 1.0},  # or partial: {0: 1.8}
+    n_starts=24, n_steps=600, learning_rate=0.05,
+    bounds=(np.full(p, -1.0), np.full(p, 1.0)),
+)
+#+end_example
+
+** Classification
+
+#+begin_example
+from difftree import DifferentiableTreeClassifier
+m = DifferentiableTreeClassifier(depth=5).fit(X_tr, y_tr)
+probs = m.predict_proba(X_te)
+probs, H_aleatoric, H_epistemic = m.predict_proba(X_te, return_components=True)
+#+end_example
+
+The entropy decomposition follows the standard mutual-information identity
+$H[\mathbb{E}_\ell \pi_\ell] = \mathbb{E}_\ell H[\pi_\ell] + I[Y; \ell \mid x]$
+used for separating aleatoric from epistemic uncertainty in Bayesian deep
+learning cite:depeweg2018decomposition.
+
+* Model
+
+The tree has fixed depth $D$ with $2^D - 1$ internal nodes and $2^D$ leaves
+in BFS order. Each internal node $i$ holds an oblique split parameterized by
+$(w_i \in \mathbb{R}^p, b_i \in \mathbb{R})$. The split function is
+
+\begin{equation*}
+s_i(x) \;=\; \sigma\!\bigl(\gamma_d \, (w_i^{\top} x + b_i)\bigr),
+\qquad
+\sigma(z) = \frac{1}{1+e^{-z}},
+\end{equation*}
+
+where $\gamma_d$ is a per-depth steepness. The probability that input $x$
+reaches leaf $\ell$ is the product of $s_i$ or $1-s_i$ along the path,
+computed in log space for numerical stability.
+
+** Leaves
+
+For univariate regression, leaf $\ell$ stores $(\mu_\ell, \sigma_\ell^2)$.
+For multivariate regression, it stores $(\mu_\ell \in \mathbb{R}^{d_y}, L_\ell)$
+where $L_\ell$ is a Cholesky factor with positive-softplus diagonal so that
+$\Sigma_\ell = L_\ell L_\ell^{\top}$ is positive-definite by construction. For
+classification, leaves hold categorical logits.
+
+** Predictive distribution
+
+\begin{equation*}
+p(y \mid x) \;=\; \sum_{\ell=1}^{2^D} \mu_\ell(x) \, \mathcal{N}\!\bigl(y;\, \mu_\ell, \alpha\, L_\ell L_\ell^{\top}\bigr),
+\end{equation*}
+
+a conditional Gaussian mixture with input-dependent mixture weights, in the
+spirit of mixture density networks cite:bishop1994mdn but with a
+tree-structured parameterization of the mixture rather than a black-box neural
+network. The scalar $\alpha = \exp(\log\alpha)$ is fitted post-hoc on a
+held-out validation slice as an LLPR/temperature-scaling-style variance
+correction.
+
+** Variance decomposition
+
+By the law of total variance,
+
+\begin{equation*}
+\mathrm{Cov}[y \mid x]
+\;=\; \underbrace{\mathbb{E}_\ell\bigl[\Sigma_\ell\bigr]}_{\text{aleatoric}}
+\;+\; \underbrace{\mathrm{Cov}_\ell\bigl[\mu_\ell\bigr]}_{\text{routing}},
+\end{equation*}
+
+where the expectation and covariance are taken with respect to leaf index
+$\ell$ weighted by the path probabilities $\mu_\ell(x)$. Both pieces are
+exposed by ~predict(return_components=True)~ and by ~predict_full_cov~.
+
+** Training
+
+The loss is the negative marginal log-likelihood $-\log p(y \mid x)$ averaged
+over the training set. Adam with global gradient-norm clipping is used. A
+short warmup phase trains splits and leaf means with leaf variances frozen at
+$\sigma_\ell^2 \approx 1$ to avoid the classic variance-collapse pathology of
+heteroscedastic NLL training cite:lakshminarayanan2017simple. The steepness
+$\gamma$ is annealed from $\gamma_{\text{init}}$ to $\gamma_{\max}$ on a fixed
+per-epoch schedule during both phases, in the same spirit as cite:hehn2020end
+except that $\gamma$ is not driven to infinity, preserving soft-routing UQ at
+test time.
+
+** Calibration
+
+After training, splits and leaf parameters are frozen, and a small set of
+calibration parameters (per-depth $\log\gamma$ and, for regressors,
+$\log\alpha$) are fitted by Adam on the held-out validation slice by
+minimizing NLL. This is the tree analogue of temperature scaling
+cite:guo2017calibration, a low-dimensional post-hoc rescaling that targets
+the predictive distribution's calibration without altering its mean structure.
+Empirical coverage of the resulting prediction intervals tracks nominal
+coverage closely on the test set, as demonstrated in the heteroscedastic-noise
+notebook.
+
+** Cross-conditioning and inverse design
+
+For multivariate $y$, the conditional $p(y_{\text{unobs}} \mid x, y_{\text{obs}})$
+is again a Gaussian mixture, with each leaf's component obtained by Schur
+complement on $\Sigma_\ell$ and the leaf weights re-normalized by the marginal
+density of $y_{\text{obs}}$ under each leaf. This recipe is standard for
+Gaussian mixtures and gives closed-form conditional mean and covariance and
+exact mixture sampling.
+
+Inverse design exploits the fact that the tree's likelihood
+$\log p(y_{\text{target}} \mid x)$ is end-to-end differentiable in $x$ since
+splits and leaves are smooth. We optimize $x$ by Adam ascent with multiple
+random restarts to handle the multimodality of the soft mixture surface.
+Constrained variants where only a subset of outputs are targeted are
+supported by passing a partial dict of target values.
+
+* Repository layout
+
+| File                                            | Contents                                          |
+|-------------------------------------------------+---------------------------------------------------|
+| ~src/difftree/_model.py~                        | JAX core (paths, NLL, conditionals, inverse loss) |
+| ~src/difftree/_train.py~                        | training and calibration loops                    |
+| ~src/difftree/_inverse.py~                      | gradient-ascent inverse-design driver             |
+| ~src/difftree/regressor.py~                     | sklearn-compatible regressor                      |
+| ~src/difftree/classifier.py~                    | sklearn-compatible classifier                     |
+| ~tests/test_basic.py~                           | univariate smoke tests                            |
+| ~tests/test_multivariate.py~                    | multivariate, conditional, inverse design tests   |
+| ~notebooks/heteroscedastic_demo.ipynb~          | UQ demo on a saturating sensor                    |
+| ~notebooks/multivariate_inverse_design.ipynb~   | multivariate + inverse design                     |
+
+* Limitations and caveats
+
+- The fixed-depth full-binary structure makes JAX-friendly vectorization easy but caps practical depth around $D \le 10$ to $12$ because of the $2^D - 1$ split-parameter blowup. For larger problems, a grown-tree variant in the style of cite:hehn2020end can be added later as a separate fitter that reuses the same tree representation.
+- Splits are oblique linear by default. Non-linear splits (small CNNs or feature-attention gates) fit the same training framework but are not yet exposed as a public API.
+- Inverse design is local; multi-start ascent is the practical fallback for multimodality.
+
+* References
+
+bibliographystyle:unsrtnat
+bibliography:references.bib
