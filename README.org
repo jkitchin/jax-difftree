@@ -17,6 +17,11 @@ clean decomposition of uncertainty into within-leaf (aleatoric) and
 between-leaf (routing) components, and, for multivariate outputs, closed-form
 cross-conditioning and gradient-based inverse design as direct consequences.
 
+For surrogate optimization, leaves can be affine ($A_\ell x + b_\ell$, with
+optional Jacobian matching), the soft tree can be hardened into a crisp
+piecewise-affine model, and that model exports as leaf polytopes or as the
+solver-neutral JSON spec of jax-ldt for exact MILP embedding.
+
 The implementation is closest in spirit to the end-to-end deterministic-tree
 formulation of cite:hehn2020end, with two practical departures motivated by
 UQ. First, splits are kept finitely soft at test time rather than annealed to
@@ -42,7 +47,9 @@ related lines of work make trees differentiable in some form:
 For UQ, the issue with annealing $\gamma \to \infty$ is that the soft-routing
 component of predictive uncertainty is destroyed. ~difftree~ keeps $\gamma$
 finite at test time and exposes the routing component explicitly, while still
-supporting hard inference for users who want fast point predictions.
+supporting hard inference (~predict(X, hard=True)~) and an explicit hardening
+step (~harden~) for users who want crisp point predictions or a MILP-embeddable
+model.
 
 Non-greedy oblique training generally has been a productive direction
 cite:norouzi2015efficient,murthy1994system, and the soft-routing formulation
@@ -56,7 +63,7 @@ cd trees
 uv sync
 #+end_example
 
-The package depends on ~jax~, ~optax~, ~scikit-learn~, and ~numpy~.
+The package depends on ~jax~, ~optax~, ~scikit-learn~, ~scipy~, and ~numpy~.
 
 * Quickstart
 
@@ -111,6 +118,54 @@ x_best, log_lik, x_all, log_liks = model.inverse_design(
 )
 #+end_example
 
+** Affine leaves and Jacobian matching
+
+#+begin_example
+model = DifferentiableTreeRegressor(
+    depth=3,
+    leaf_type="affine",       # leaf l predicts A_l x + b_l
+    constant_outputs=[1],     # output 1 stays constant per leaf
+    jacobian_weight=1.0,
+)
+model.fit(X_tr, Y_tr, dydx=J_tr)   # J_tr: (n, d_y, p) dy/dx, optional
+mean, std = model.predict(X_te, return_std=True)
+#+end_example
+
+All outputs share one partition, so one tree per unit operation means one set
+of binaries in a MILP. ~constant_outputs~ keeps selected outputs (e.g.
+intensive properties that enter blending) constant per leaf so that bilinear
+blend terms linearize exactly.
+
+** Crisp mode, hardening, and the soft/hard gap
+
+#+begin_example
+y_hard = model.predict(X_te, hard=True)   # route by the sign of each split
+leaves = model.apply(X_te)                # crisp leaf index per row
+
+model.harden(X_tr, Y_tr, dydx=J_tr)       # or fit with hardening=True
+model.hardening_report_["before"]         # soft vs hard on validation, pre-hardening
+model.hardening_report_["after"]          # ... and after
+model.soft_hard_gap(X_te, Y_te)           # same report on any data
+#+end_example
+
+** Export for MILP embedding
+
+#+begin_example
+from difftree import export
+
+polys = export.leaf_polytopes(model, bounds=(lo, hi), X=X_tr)
+for lp in polys:            # {x : lp.G x <= lp.h}, y = lp.coef x + lp.intercept
+    print(lp.leaf, lp.G.shape, lp.coef, lp.intercept, lp.cov)
+
+s = export.to_json(model, "tree.json", bounds=(lo, hi))  # jax-ldt v1 spec
+y = export.predict_spec(s, X_te)       # == model.predict(X_te, hard=True)
+
+# With jax-ldt installed:
+#   from jax_ldt import from_json
+#   from jax_ldt.export import embed_in_discopt_model
+#   tree = from_json(s)
+#+end_example
+
 ** Classification
 
 #+begin_example
@@ -148,6 +203,12 @@ For multivariate regression, it stores $(\mu_\ell \in \mathbb{R}^{d_y}, L_\ell)$
 where $L_\ell$ is a Cholesky factor with positive-softplus diagonal so that
 $\Sigma_\ell = L_\ell L_\ell^{\top}$ is positive-definite by construction. For
 classification, leaves hold categorical logits.
+
+With ~leaf_type="affine"~ the leaf mean becomes
+$m_\ell(x) = \mu_\ell + A_\ell x$ with $A_\ell \in \mathbb{R}^{d_y \times p}$;
+rows of $A_\ell$ listed in ~constant_outputs~ are fixed at zero. The noise
+model $\Sigma_\ell$ is unchanged, and every formula below holds with $\mu_\ell$
+replaced by $m_\ell(x)$.
 
 ** Predictive distribution
 
@@ -188,6 +249,18 @@ per-epoch schedule during both phases, in the same spirit as cite:hehn2020end
 except that $\gamma$ is not driven to infinity, preserving soft-routing UQ at
 test time.
 
+When ~fit~ receives Jacobians $J_i = \partial y / \partial x \,|_{x_i}$, the
+loss gains a Sobolev term (in standardized units)
+
+\begin{equation*}
+\lambda \, \frac{1}{n} \sum_i \Bigl\| \textstyle\sum_\ell \mu_\ell(x_i) A_\ell - J_i \Bigr\|_F^2,
+\end{equation*}
+
+with $\lambda$ = ~jacobian_weight~ and only the affine outputs included. The
+path-weighted leaf slope $\sum_\ell \mu_\ell A_\ell$ is the Jacobian of the
+crisp tree inside a leaf, so the term teaches leaf slopes without penalizing
+the steep transitions between leaves that exist only because routing is soft.
+
 ** Calibration
 
 After training, splits and leaf parameters are frozen, and a small set of
@@ -216,6 +289,49 @@ random restarts to handle the multimodality of the soft mixture surface.
 Constrained variants where only a subset of outputs are targeted are
 supported by passing a partial dict of target values.
 
+** Crisp routing and hardening
+
+Crisp routing sends $x$ right at node $i$ iff $w_i^{\top} x + b_i > 0$. This
+is the $\gamma \to \infty$ limit of the soft routing, where the path
+probability concentrates on one leaf, and it partitions the input space into
+polytopes. ~predict(hard=True)~ returns that leaf's Gaussian, so the routing
+variance is zero.
+
+~harden~ (or ~fit(..., hardening=True)~) converts the soft tree into a crisp
+model in four steps: (1) continue training while $\gamma$ grows geometrically
+from ~gamma_max~ to ~gamma_hard~ over ~n_hard_epochs~ epochs; (2) freeze the
+partition by routing each training point crisply; (3) refit each leaf by
+least squares on its points (regression on $[1, x]$ for affine outputs, the
+mean for constant ones, with Jacobian rows added when ~dydx~ is given, and
+ridge shrinkage ~hard_ridge~ toward the soft values); refit each leaf noise
+covariance from its residuals; (4) fit $\alpha$ in closed form on the
+validation slice under crisp routing. ~hardening_report_~ records
+~soft_hard_gap~ on the validation slice before and after: per-output RMSE and
+$R^2$ for soft and crisp predictions, their NLLs, the average largest leaf
+probability, and how often the most likely soft leaf is the crisp leaf. A
+large gap before hardening means the soft fit relies on blending leaves and
+is a misleading guide to the crisp model.
+
+** Export
+
+In original units, node $i$ goes left iff $a_i^{\top} x \le t_i$ with
+$a_i = w_i / s_x$ and $t_i = a_i^{\top} m_x - b_i$ (the standardization is
+undone). Leaf $\ell$ is the polytope $\{x : G_\ell x \le h_\ell\}$ formed by
+its path half-spaces and an input box, and its model is
+$y = C_\ell x + c_\ell$ with noise covariance $D \Sigma_\ell D$.
+~export.leaf_polytopes~ returns these, after one LP per leaf (Chebyshev ball)
+removes leaves with an empty interior, and optionally leaves that no row of a
+given ~X~ reaches.
+
+~export.to_spec~ / ~to_json~ emit the v1 spec of jax-ldt (~jax_ldt.export.spec~)
+with ~kind = "hyperplane_tree"~. The transform matrix is
+$[I_p \mid a_1 \cdots a_k]$, with one lifted column per kept internal node,
+and the leaf parameters use only the first $p$ (raw) columns. Pruned splits are
+collapsed into their kept child. The jax-ldt loader (~from_json~ /
+~predict_tree~) and its discopt adapter (~embed_in_discopt_model~) therefore
+consume difftree models unchanged. Extra information (bounds, BFS leaf ids,
+leaf covariances) goes under a top-level ~"difftree"~ key.
+
 * Repository layout
 
 | File                                            | Contents                                          |
@@ -225,16 +341,21 @@ supported by passing a partial dict of target values.
 | ~src/difftree/_inverse.py~                      | gradient-ascent inverse-design driver             |
 | ~src/difftree/regressor.py~                     | sklearn-compatible regressor                      |
 | ~src/difftree/classifier.py~                    | sklearn-compatible classifier                     |
+| ~src/difftree/export.py~                        | leaf polytopes and jax-ldt JSON spec export       |
 | ~tests/test_basic.py~                           | univariate smoke tests                            |
 | ~tests/test_multivariate.py~                    | multivariate, conditional, inverse design tests   |
+| ~tests/test_affine_hard_export.py~              | affine leaves, Jacobians, hardening, export       |
 | ~notebooks/heteroscedastic_demo.ipynb~          | UQ demo on a saturating sensor                    |
 | ~notebooks/multivariate_inverse_design.ipynb~   | multivariate + inverse design                     |
+| ~notebooks/piecewise_linear_milp.ipynb~         | affine leaves, hardening, MILP export             |
 
 * Limitations and caveats
 
 - The fixed-depth full-binary structure makes JAX-friendly vectorization easy but caps practical depth around $D \le 10$ to $12$ because of the $2^D - 1$ split-parameter blowup. For larger problems, a grown-tree variant in the style of cite:hehn2020end can be added later as a separate fitter that reuses the same tree representation.
 - Splits are oblique linear by default. Non-linear splits (small CNNs or feature-attention gates) fit the same training framework but are not yet exposed as a public API.
 - Inverse design is local; multi-start ascent is the practical fallback for multimodality.
+- The exported leaf polytopes are closed, as is standard in big-M MILP formulations, so a MILP optimum can sit on a split boundary and use either neighbouring leaf's model there. Crisp prediction breaks such ties to the left. jax-ldt's ~boundary_eps~ option enforces the same convention in the MILP.
+- A pruned spec matches ~predict(hard=True)~ only inside the export box. Pruning unreached leaves (~prune_unreached=True~) also reassigns their regions to neighbouring leaves.
 
 * References
 

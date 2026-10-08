@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -490,6 +490,7 @@ dependencies = [
     { name = "numpy" },
     { name = "optax" },
     { name = "scikit-learn" },
+    { name = "scipy" },
 ]
 
 [package.dev-dependencies]
@@ -505,6 +506,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
+    { name = "scipy", specifier = ">=1.13" },
 ]
 
 [package.metadata.requires-dev]

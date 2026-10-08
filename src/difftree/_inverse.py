@@ -27,6 +27,7 @@ def _make_loss(params: dict, obs_idx: jnp.ndarray, y_target_obs: jnp.ndarray):
             params["b"],
             params["log_gamma"],
             params["leaf_mu"],
+            params["leaf_A"],
             params["leaf_chol_raw"],
             params["log_alpha"],
         )

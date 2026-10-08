@@ -3,7 +3,9 @@
 Public API:
     DifferentiableTreeRegressor
     DifferentiableTreeClassifier
+    difftree.export: leaf polytopes and jax-ldt JSON spec export
 """
+from . import export
 from .classifier import DifferentiableTreeClassifier
 from .regressor import DifferentiableTreeRegressor
 
