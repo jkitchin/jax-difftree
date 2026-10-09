@@ -438,6 +438,8 @@ plots all three variants across the worst split of the discontinuous tree.
 | ~notebooks/heteroscedastic_demo.ipynb~          | UQ demo on a saturating sensor                    |
 | ~notebooks/multivariate_inverse_design.ipynb~   | multivariate + inverse design                     |
 | ~notebooks/piecewise_linear_milp.ipynb~         | affine leaves, hardening, MILP export             |
+| ~notebooks/scaling.ipynb~                       | size, fit and prediction cost vs depth            |
+| ~notebooks/failure_modes.ipynb~                 | seeds, local inverse design, extrapolation UQ     |
 
 * Limitations and caveats
 

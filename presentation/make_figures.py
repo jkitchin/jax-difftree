@@ -287,3 +287,161 @@ def draw_inv(k):
 
 save_gif(FuncAnimation(fig, draw_inv, frames=frames), "anim_inverse.gif", fps=12)
 plt.close(fig)
+
+
+# ---------------------------------------------------------------- Piecewise-affine surrogates for MILP
+# Same problem as notebooks/piecewise_linear_milp.ipynb.
+from difftree import export
+
+
+def truth_pw(X):
+    u = X[:, 0] + 0.02 * X[:, 1] - 1.0           # oblique kink
+    y0 = np.where(u > 0, 3.0 * u, -1.0 * u) + 0.01 * X[:, 1]
+    y1 = np.where(u > 0, 0.8, 0.2)
+    return np.stack([y0, y1], axis=1)
+
+
+rng = np.random.default_rng(0)
+lo, hi = np.array([0.0, -50.0]), np.array([2.0, 50.0])
+X_te = rng.uniform(lo, hi, (4000, 2)); Y_te = truth_pw(X_te)
+Xp = rng.uniform(lo, hi, (60, 2))
+Yp = truth_pw(Xp) + 0.01 * rng.normal(size=(60, 2))
+common = dict(depth=2, n_epochs=300, batch_size=32, hardening=True, random_state=0)
+aff = dict(leaf_type="affine", constant_outputs=[1], **common)
+variants = {
+    "discontinuous": dict(),
+    "continuous, untied": dict(continuous=True),
+    "continuous, tied": dict(continuous=True, tied_splits=True),
+}
+fits2d = {k: DifferentiableTreeRegressor(**aff, **kw).fit(Xp, Yp) for k, kw in variants.items()}
+const = DifferentiableTreeRegressor(**common).fit(Xp, Yp)
+for name, mod in (("constant", const), ("affine", fits2d["discontinuous"])):
+    r = np.sqrt(np.mean((mod.predict(X_te, hard=True) - Y_te) ** 2, axis=0))
+    print(f"{name} leaves: hard RMSE {np.round(r, 3)}")
+
+# Figure: constant vs affine leaves along a line across the kink (x1 = 0)
+xs = np.linspace(lo[0], hi[0], 600)
+S0 = np.c_[xs, np.zeros_like(xs)]
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for k, (ax, lab) in enumerate(zip(axes, ("y₀: piecewise linear", "y₁: kept constant per leaf"))):
+    ax.plot(xs, truth_pw(S0)[:, k], ":", color="0.4", lw=2.5, label="truth")
+    ax.plot(xs, const.predict(S0, hard=True)[:, k], color=ORANGE, lw=2, label="constant leaves")
+    ax.plot(xs, fits2d["discontinuous"].predict(S0, hard=True)[:, k], color=NAVY, lw=2, label="affine leaves")
+    ax.set(xlabel="x₀  (x₁ = 0)", title=lab)
+axes[0].legend(fontsize=11)
+fig.tight_layout(); fig.savefig(OUT / "leaves_affine.png", dpi=150); plt.close(fig)
+print("wrote leaves_affine.png")
+
+# Figure: hardening makes the soft and crisp models agree (1-D, affine leaves)
+import copy
+rh = np.random.default_rng(0)
+xh = rh.uniform(-2, 2, (300, 1)); yh = np.sin(2 * xh[:, 0]) + 0.03 * rh.normal(size=300)
+soft = DifferentiableTreeRegressor(depth=3, n_epochs=200, leaf_type="affine", gamma_max=2.0,
+                                   random_state=0).fit(xh, yh)
+hard = copy.deepcopy(soft).harden(xh, yh)
+xg = np.linspace(-2, 2, 1500)[:, None]
+fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+for ax, mod, title in ((axes[0], soft, "Before hardening"), (axes[1], hard, "After harden()")):
+    ax.scatter(xh[:, 0], yh, s=6, color="0.75")
+    ax.plot(xg[:, 0], mod.predict(xg), color=SKY, lw=3, label="soft  predict()")
+    ax.plot(xg[:, 0], mod.predict(xg, hard=True), color=NAVY, lw=1.6, label="crisp  predict(hard=True)")
+    gap = mod.soft_hard_gap(xh, yh)
+    ax.set(xlabel="x", title=f"{title}: crisp RMSE {gap['rmse_hard'][0]:.3f}")
+axes[0].set_ylabel("y"); axes[0].legend(fontsize=11, loc="lower right")
+fig.tight_layout(); fig.savefig(OUT / "hardening.png", dpi=150); plt.close(fig)
+print("wrote hardening.png")
+
+# Figure: leaf polytopes and the exported surface
+mp = fits2d["discontinuous"]
+polys = export.leaf_polytopes(mp, bounds=(lo, hi), X=Xp)
+g0, g1 = np.meshgrid(np.linspace(lo[0], hi[0], 300), np.linspace(lo[1], hi[1], 300))
+G = np.stack([g0.ravel(), g1.ravel()], axis=1)
+region = np.full(G.shape[0], np.nan)
+for k, lp in enumerate(polys):
+    region[lp.contains(G)] = k
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+axes[0].pcolormesh(g0, g1, region.reshape(g0.shape), cmap=matplotlib.colors.ListedColormap([ICE, SKY]),
+                   shading="auto")
+axes[0].scatter(Xp[:, 0], Xp[:, 1], s=12, color=NAVY)
+u0 = np.linspace(lo[1], hi[1], 2)
+axes[0].plot(1.0 - 0.02 * u0, u0, "--", color=ORANGE, lw=2, label="true kink")
+axes[0].set(xlabel="x₀", ylabel="x₁", title=f"{len(polys)} non-empty leaf polytopes of {2 ** mp.depth}")
+axes[0].legend(loc="upper right")
+pred = export.predict_spec(export.to_spec(mp, bounds=(lo, hi)), G)[:, 0]
+im = axes[1].pcolormesh(g0, g1, pred.reshape(g0.shape), cmap="Blues", shading="auto")
+axes[1].contour(g0, g1, pred.reshape(g0.shape), levels=12, colors=NAVY, linewidths=0.6)
+fig.colorbar(im, ax=axes[1], label="y₀ from the exported spec")
+axes[1].set(xlabel="x₀", title="Exported piecewise-affine y₀")
+fig.tight_layout(); fig.savefig(OUT / "milp_polytopes.png", dpi=150); plt.close(fig)
+print("wrote milp_polytopes.png")
+
+# Figure: jumps vs continuity, sliced across the discontinuous tree's worst split
+f3 = lambda Z: np.abs(Z[:, 0]) + Z[:, 1] + np.maximum(Z[:, 2], 0)
+r3 = np.random.default_rng(1)
+X3 = r3.uniform(-2, 2, (600, 3)); y3 = f3(X3) + 0.02 * r3.normal(size=600)
+X3_te = r3.uniform(-2, 2, (5000, 3))
+kw3 = dict(depth=3, n_epochs=80, leaf_type="affine", hardening=True, n_hard_epochs=20, random_state=0)
+fits3d = {k: DifferentiableTreeRegressor(**kw3, **kw).fit(X3, y3) for k, kw in variants.items()}
+for k in variants:
+    ra = np.sqrt(np.mean((fits2d[k].predict(X_te, hard=True)[:, 0] - Y_te[:, 0]) ** 2))
+    rb = np.sqrt(np.mean((fits3d[k].predict(X3_te, hard=True) - f3(X3_te)) ** 2))
+    print(f"{k:>20s}: 2-D RMSE {ra:.3f} jump {fits2d[k].hardening_report_['max_boundary_jump'][0]:.2e} | "
+          f"3-D RMSE {rb:.3f} jump {fits3d[k].hardening_report_['max_boundary_jump'][0]:.2e}")
+
+
+def worst_slice(model, half_width=1.0, n=2000):
+    j = export.boundary_jumps(model)[0]
+    w = model.params_["W"][j["node"]]
+    step = (w / np.linalg.norm(w)) * model.x_std_
+    t = np.linspace(-half_width, half_width, n)
+    return t, j["worst_point"][0][None, :] + t[:, None] * step[None, :]
+
+
+styles = {"discontinuous": (MID, "-"), "continuous, untied": (ORANGE, "--"), "continuous, tied": (NAVY, "-")}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+for ax, fits, f_true, title in (
+    (axes[0], fits2d, lambda Z: truth_pw(Z)[:, 0], "2-D oblique kink (y₀), depth 2"),
+    (axes[1], fits3d, f3, "|x₀| + x₁ + max(x₂, 0), depth 3"),
+):
+    t, S = worst_slice(fits["discontinuous"])
+    ax.plot(t, f_true(S), ":", color="0.4", lw=2.5, label="truth")
+    for k, mod in fits.items():
+        c, ls = styles[k]
+        p = mod.predict(S, hard=True)
+        ax.plot(t, p[:, 0] if p.ndim == 2 else p, color=c, ls=ls, lw=2, label=k)
+    ax.axvline(0, color="0.75", lw=0.8)
+    ax.set_xticks([-1, -0.5, 0, 0.5, 1])
+    ax.set(xlabel="distance across the worst split (standardized x)", ylabel="crisp prediction", title=title)
+    ax.legend(fontsize=11)
+fig.tight_layout(); fig.savefig(OUT / "jumps_continuity.png", dpi=150); plt.close(fig)
+print("wrote jumps_continuity.png")
+
+# Figure: a MILP solution on a split boundary, and its repair
+j = export.boundary_jumps(mp, bounds=(lo, hi))[0]
+x_b = j["worst_point"][0]
+pl = {lp.leaf: lp for lp in export.leaf_polytopes(mp, bounds=(lo, hi))}
+routed = mp.apply(x_b[None])[0]
+chosen = j["right"] if routed == j["left"] else j["left"]
+x_fix = export.repair_solution(mp, x_b, chosen, bounds=(lo, hi))
+w = mp.params_["W"][j["node"]]
+step = (w / np.linalg.norm(w)) * mp.x_std_
+t = np.linspace(-0.3, 0.3, 1200)
+S = x_b[None, :] + t[:, None] * step[None, :]
+fig, ax = plt.subplots(figsize=(8, 4.6))
+for leaf, side, c in ((j["left"], t <= 0, MID), (j["right"], t > 0, MID)):
+    yl = pl[leaf].predict(S)[:, 0]
+    ax.plot(t, yl, ":", color="0.6", lw=1.2)
+ax.plot(t, mp.predict(S, hard=True)[:, 0], color=NAVY, lw=2.5, label="crisp model")
+ax.plot(t, truth_pw(S)[:, 0], color=ORANGE, lw=1, alpha=0.6, label="truth")
+v_milp = pl[chosen].predict(x_b[None])[0, 0]
+v_crisp = mp.predict(x_b[None], hard=True)[0, 0]
+ax.plot(0, v_milp, "o", ms=11, color=ORANGE, mec="k", label=f"MILP objective (leaf {chosen}): {v_milp:.3f}")
+ax.plot(0, v_crisp, "s", ms=10, color=SKY, mec="k", label=f"predict(hard=True) at that x: {v_crisp:.3f}")
+ax.annotate("repair_solution:\nmove δ into leaf %d" % chosen, xy=(0.012, v_milp), xytext=(0.09, v_milp - 0.25),
+            arrowprops=dict(arrowstyle="->", color=NAVY), color=NAVY, fontsize=12)
+ax.axvline(0, color="0.75", lw=0.8)
+ax.set(xlabel="distance across split (standardized x)", ylabel="y₀",
+       title="A MILP optimum can sit on a split boundary")
+ax.legend(fontsize=10, loc="upper left")
+fig.tight_layout(); fig.savefig(OUT / "milp_repair.png", dpi=150); plt.close(fig)
+print("wrote milp_repair.png", v_milp, v_crisp, mp.predict(x_fix[None], hard=True)[0, 0])
