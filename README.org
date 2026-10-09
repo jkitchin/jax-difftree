@@ -166,6 +166,20 @@ y = export.predict_spec(s, X_te)       # == model.predict(X_te, hard=True)
 #   tree = from_json(s)
 #+end_example
 
+** Split boundaries: jumps, continuity, and repairing MILP solutions
+
+#+begin_example
+export.boundary_jumps(model, bounds=(lo, hi))   # largest jump per shared facet
+
+# After a MILP solve (e.g. discopt via jax-ldt): result.x["x"], result.x["tree_z"]
+leaf = export.leaf_from_binaries(s, z)           # leaf the solver chose
+x_ok = export.repair_solution(model, x_milp, leaf, delta=1e-6)
+model.predict(x_ok[None], hard=True)             # == the MILP objective (to O(delta))
+
+# Continuous hardened model (opt-in; see the trade-off below)
+model.harden(X_tr, Y_tr, continuous=True, bounds=(lo, hi))
+#+end_example
+
 ** Classification
 
 #+begin_example
@@ -332,6 +346,45 @@ collapsed into their kept child. The jax-ldt loader (~from_json~ /
 consume difftree models unchanged. Extra information (bounds, BFS leaf ids,
 leaf covariances) goes under a top-level ~"difftree"~ key.
 
+** Split boundaries
+
+A crisp piecewise-affine tree can jump across a split boundary. A MILP treats
+the leaf polytopes as closed sets, so its optimum can sit on a boundary and
+use either neighbouring leaf's model there, while ~predict(hard=True)~ sends
+boundary points left. The MILP objective is then the true infimum of the
+crisp model, but the returned $x$ is on the wrong side of a measure-zero
+boundary. ~export.repair_solution~ fixes this with one LP: it returns the
+closest point (max-norm, standardized units) that lies at least $\delta$
+inside every face of the leaf the solver chose (~export.leaf_from_binaries~
+reads that leaf from the binaries), so crisp prediction there matches the
+MILP objective to $O(\delta)$. Unlike a strict-inequality margin in the MILP
+(jax-ldt's ~boundary_eps~), it leaves the formulation unchanged and so cannot
+create spurious infeasibility. If a surrogate output appears in a MILP
+constraint, the repaired point can move it by $\delta$ times its slope.
+
+A large jump is usually fitting error, and an optimizer will seek it out.
+~export.boundary_jumps~ finds every pair of leaves sharing a
+$(p-1)$-dimensional facet in the box (one LP per candidate pair) and
+maximizes the difference of their models over the facet (two LPs per
+output); ~hardening_report_["max_boundary_jump"]~ records the per-output
+maximum.
+
+~harden(..., continuous=True)~ removes the jumps: across node $i$'s
+hyperplane the two leaf models may differ only by a multiple of
+$w_i^{\top} x + b_i$, which is $p$ linear equality constraints per shared
+facet, and the leaves are refit by one joint constrained least-squares
+problem (or with a penalty, ~continuity_weight~). Continuity is expensive on
+an oblique tree. Where a deeper split meets a parent boundary (a T-junction),
+both leaves of that split must agree with the same neighbour, which forces
+them to be equal unless the two hyperplanes coincide. Continuity also pins
+each kink to the learned split, so any error in where the split sits shows up
+directly in the predictions. In tests, exact continuity raised the crisp RMSE
+from 0.017 to 0.30 (depth 3, three inputs) and from 0.06 to 0.17 on a single
+oblique kink; the penalty did not find a useful middle ground. Use it when a
+jump-free surrogate matters more than accuracy, or for one input, where the
+cost is small (0.19 to 0.23 RMSE on $\sin 2x$). Otherwise repair the solution
+and check ~boundary_jumps~ near it.
+
 * Repository layout
 
 | File                                            | Contents                                          |
@@ -341,7 +394,8 @@ leaf covariances) goes under a top-level ~"difftree"~ key.
 | ~src/difftree/_inverse.py~                      | gradient-ascent inverse-design driver             |
 | ~src/difftree/regressor.py~                     | sklearn-compatible regressor                      |
 | ~src/difftree/classifier.py~                    | sklearn-compatible classifier                     |
-| ~src/difftree/export.py~                        | leaf polytopes and jax-ldt JSON spec export       |
+| ~src/difftree/export.py~                        | leaf polytopes, jax-ldt spec, jumps, MILP repair  |
+| ~src/difftree/_geometry.py~                     | polytope LPs: leaf regions, shared facets         |
 | ~tests/test_basic.py~                           | univariate smoke tests                            |
 | ~tests/test_multivariate.py~                    | multivariate, conditional, inverse design tests   |
 | ~tests/test_affine_hard_export.py~              | affine leaves, Jacobians, hardening, export       |
@@ -354,7 +408,8 @@ leaf covariances) goes under a top-level ~"difftree"~ key.
 - The fixed-depth full-binary structure makes JAX-friendly vectorization easy but caps practical depth around $D \le 10$ to $12$ because of the $2^D - 1$ split-parameter blowup. For larger problems, a grown-tree variant in the style of cite:hehn2020end can be added later as a separate fitter that reuses the same tree representation.
 - Splits are oblique linear by default. Non-linear splits (small CNNs or feature-attention gates) fit the same training framework but are not yet exposed as a public API.
 - Inverse design is local; multi-start ascent is the practical fallback for multimodality.
-- The exported leaf polytopes are closed, as is standard in big-M MILP formulations, so a MILP optimum can sit on a split boundary and use either neighbouring leaf's model there. Crisp prediction breaks such ties to the left. jax-ldt's ~boundary_eps~ option enforces the same convention in the MILP.
+- The exported leaf polytopes are closed, as is standard in big-M MILP formulations, so a MILP optimum can sit on a split boundary and use either neighbouring leaf's model there. ~export.repair_solution~ moves such a point into the chosen leaf (see "Split boundaries" above).
+- Continuity (~continuous=True~) costs accuracy on oblique trees in more than one dimension, because T-junctions over-constrain the leaves and the kinks are pinned to the learned splits. Making it cheap would require re-optimizing the splits under the continuity constraint, which is not implemented.
 - A pruned spec matches ~predict(hard=True)~ only inside the export box. Pruning unreached leaves (~prune_unreached=True~) also reassigns their regions to neighbouring leaves.
 
 * References

@@ -161,7 +161,8 @@ def test_hardening_recovers_linear_truth_exactly():
 def test_hardening_report(hardened, pwl_data):
     X, Y, X_te, Y_te = pwl_data
     rep = hardened.hardening_report_
-    assert set(rep) == {"before", "after", "n_validation"}
+    assert set(rep) == {"before", "after", "n_validation", "continuous", "max_boundary_jump"}
+    assert rep["continuous"] == []
     keys = {"rmse_soft", "rmse_hard", "rmse_gap", "r2_soft", "r2_hard",
             "nll_soft", "nll_hard", "mean_max_leaf_prob", "routing_agreement"}
     assert set(rep["before"]) == set(rep["after"]) == keys
@@ -282,3 +283,106 @@ def test_spec_univariate_and_custom_bounds(pwl_data):
     pred = export.predict_spec(spec, X_in)
     assert pred.shape == (300,)
     np.testing.assert_allclose(pred, m.predict(X_in, hard=True), rtol=1e-9, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Split boundaries: jumps, continuity, MILP solution repair
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def sine_1d():
+    rng = np.random.default_rng(8)
+    X = rng.uniform(-3, 3, (300, 1))
+    y = np.sin(2 * X[:, 0]) + 0.02 * rng.normal(size=300)
+    return X, y
+
+
+def test_boundary_jumps_measure_discontinuity(hardened):
+    jumps = export.boundary_jumps(hardened)
+    assert jumps, "a depth-2 tree splitting the box has at least one facet"
+    worst = jumps[0]
+    assert set(worst) == {"node", "left", "right", "point", "max_jump", "worst_point"}
+    assert worst["worst_point"].shape == (2, 2)
+    assert worst["max_jump"].shape == (2,)
+    # Output 1 is constant per leaf and steps from -1 to 1 across x0 = 0.
+    assert max(j["max_jump"][1] for j in jumps) > 1.0
+    # The jump at the facet point is bounded by the reported maximum.
+    polys = {lp.leaf: lp for lp in export.leaf_polytopes(hardened)}
+    for j in jumps:
+        x = j["point"][None]
+        d = np.abs(polys[j["left"]].predict(x) - polys[j["right"]].predict(x))[0]
+        assert np.all(d <= j["max_jump"] + 1e-9)
+        # ... and attained at worst_point.
+        for k in range(2):
+            xw = j["worst_point"][k][None]
+            dk = np.abs(polys[j["left"]].predict(xw) - polys[j["right"]].predict(xw))[0, k]
+            np.testing.assert_allclose(dk, j["max_jump"][k], rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(
+        hardened.hardening_report_["max_boundary_jump"],
+        np.max([j["max_jump"] for j in jumps], axis=0),
+    )
+
+
+def test_continuous_hardening_removes_jumps(sine_1d):
+    X, y = sine_1d
+    kw = dict(depth=3, n_epochs=60, leaf_type="affine", hardening=True,
+              n_hard_epochs=10, random_state=0)
+    plain = DifferentiableTreeRegressor(**kw).fit(X, y)
+    cont = DifferentiableTreeRegressor(continuous=True, **kw).fit(X, y)
+    assert plain.hardening_report_["max_boundary_jump"][0] > 1e-3
+    assert cont.hardening_report_["max_boundary_jump"][0] < 1e-8
+    assert cont.hardening_report_["continuous"] == [0]
+    # Crisp predictions agree on both sides of every split inside the box.
+    a, t = export._splits_original(cont)
+    for ti, ai in zip(t, a[:, 0]):
+        xb = ti / ai
+        if X.min() < xb < X.max():
+            side = cont.predict(np.array([[xb - 1e-9], [xb + 1e-9]]), hard=True)
+            assert abs(side[0] - side[1]) < 1e-6
+    # The continuous model still fits.
+    X_te = np.linspace(-3, 3, 500)[:, None]
+    assert np.sqrt(np.mean((cont.predict(X_te, hard=True) - np.sin(2 * X_te[:, 0])) ** 2)) < 0.4
+
+
+def test_continuity_penalty_and_override(sine_1d):
+    X, y = sine_1d
+    m = DifferentiableTreeRegressor(depth=3, n_epochs=60, leaf_type="affine",
+                                    hardening=True, n_hard_epochs=10, random_state=0)
+    m.fit(X, y)
+    m.set_params(n_hard_epochs=0, continuity_weight=1e8)
+    m.harden(X, y, continuous=True)  # per-call override of continuous=False
+    assert m.hardening_report_["max_boundary_jump"][0] < 1e-3
+
+
+def test_continuous_validation(pwl_data):
+    X, Y, _, _ = pwl_data
+    with pytest.raises(ValueError, match="affine"):
+        DifferentiableTreeRegressor(depth=1, n_epochs=2, hardening=True,
+                                    continuous=True).fit(X, Y)
+    with pytest.raises(ValueError, match="affine output"):
+        DifferentiableTreeRegressor(depth=1, n_epochs=2, leaf_type="affine",
+                                    constant_outputs=[1], hardening=True,
+                                    continuous=[1]).fit(X, Y)
+
+
+def test_repair_solution_moves_into_chosen_leaf(hardened):
+    m = hardened
+    spec = export.to_spec(m)
+    polys = {lp.leaf: lp for lp in export.leaf_polytopes(m)}
+    for j in export.boundary_jumps(m):
+        x_b = j["point"]  # on the boundary between two leaves
+        for leaf in (j["left"], j["right"]):
+            x_r = export.repair_solution(m, x_b, leaf, delta=1e-6)
+            assert m.apply(x_r[None])[0] == leaf
+            assert np.max(np.abs((x_r - x_b) / m.x_std_)) < 1e-5
+            np.testing.assert_allclose(m.predict(x_r[None], hard=True),
+                                       polys[leaf].predict(x_r[None]), atol=1e-9)
+    # leaf_from_binaries maps the spec's leaf order to BFS leaf indices.
+    leaf_nodes = np.flatnonzero(spec["tree"]["is_leaf"])
+    for k, node in enumerate(leaf_nodes):
+        z = np.zeros(len(leaf_nodes))
+        z[k] = 1.0
+        assert export.leaf_from_binaries(spec, z) == spec["difftree"]["leaf_index"][node]
+    with pytest.raises(ValueError, match="no point"):
+        export.repair_solution(m, x_b, j["left"], delta=1e3)

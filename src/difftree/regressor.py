@@ -93,6 +93,13 @@ def _mahalanobis_sq(diff: np.ndarray, cov: np.ndarray) -> np.ndarray:
     return np.einsum("nd,nd->n", diff, np.linalg.solve(cov, diff[..., None])[..., 0])
 
 
+def _max_jump(jumps: list, d_y: int) -> np.ndarray:
+    """Per-output maximum over :func:`difftree.export.boundary_jumps` rows."""
+    if not jumps:
+        return np.zeros(d_y)
+    return np.max([j["max_jump"] for j in jumps], axis=0)
+
+
 def _mvn_logpdf(diff: np.ndarray, cov: np.ndarray) -> np.ndarray:
     d = diff.shape[-1]
     _, logdet = np.linalg.slogdet(cov)
@@ -146,6 +153,17 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         Ridge strength of the least-squares leaf refit. Coefficients shrink
         toward the soft leaf values, which only matters for leaves with too
         few training points to fit on their own.
+    continuous : bool or sequence of int, default=False
+        Make the hardened model continuous across split boundaries for these
+        outputs (True: every affine output). The hardening refit then
+        requires neighbouring leaves to agree on every facet they share
+        inside the training-data box, so a MILP optimum cannot exploit a jump
+        between leaves. Only for affine outputs, and only appropriate where
+        the true response is continuous.
+    continuity_weight : float or None, default=None
+        None enforces continuity exactly. A float instead adds a penalty
+        ``continuity_weight * ||mismatch||^2`` on the coefficient mismatch
+        (standardized units) across each shared facet, allowing small jumps.
     random_state : int or None
     verbose : bool
     """
@@ -172,6 +190,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         gamma_hard: float = 50.0,
         n_hard_epochs: int = 50,
         hard_ridge: float = 1e-6,
+        continuous: bool | Sequence[int] = False,
+        continuity_weight: float | None = None,
         random_state: int | None = None,
         verbose: bool = False,
     ):
@@ -195,6 +215,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         self.gamma_hard = gamma_hard
         self.n_hard_epochs = n_hard_epochs
         self.hard_ridge = hard_ridge
+        self.continuous = continuous
+        self.continuity_weight = continuity_weight
         self.random_state = random_state
         self.verbose = verbose
 
@@ -358,7 +380,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
 
     # ------------------------------------------------------------------ hardening
 
-    def harden(self, X, y, dydx=None):
+    def harden(self, X, y, dydx=None, *, continuous=None, bounds=None):
         """Turn the fitted soft tree into a crisp piecewise model.
 
         Steps:
@@ -370,8 +392,10 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
            (:meth:`apply`).
         3. Refit every leaf by least squares on the points it holds (affine
            outputs regress on ``[1, x]``, constant outputs take the mean;
-           ``dydx`` rows join the least-squares system when given). Leaf noise
-           covariances are refit from the residuals.
+           ``dydx`` rows join the least-squares system when given). With
+           ``continuous``, the refit is one joint constrained least-squares
+           problem in which neighbouring leaves agree on their shared facets.
+           Leaf noise covariances are refit from the residuals.
         4. Fit the variance scale ``alpha`` in closed form on the held-out
            validation slice under crisp routing, and set every per-depth gamma
            to ``gamma_hard``.
@@ -380,7 +404,14 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         :meth:`fit`. Passing the training data used in ``fit`` is the usual
         choice. The result of comparing soft and hard predictions on the
         validation slice before and after hardening is stored in
-        ``hardening_report_`` (see :meth:`soft_hard_gap`).
+        ``hardening_report_`` (see :meth:`soft_hard_gap`), together with
+        ``max_boundary_jump``, the largest jump of each output across any
+        shared facet in the box (see :func:`difftree.export.boundary_jumps`).
+
+        ``continuous`` overrides the constructor setting for this call.
+        ``bounds = (lo, hi)`` (original units) sets the box in which leaves
+        must join up continuously; it defaults to the training-data box and
+        should cover the region a MILP will search.
 
         Returns self.
         """
@@ -402,11 +433,48 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             X_tr, X_val, y_tr, y_val, J_tr, _ = train_test_split(
                 Xs, ys, Js, test_size=self.validation_fraction, random_state=seed
             )
-        self._harden_std(X_tr, y_tr, J_tr, X_val, y_val, rng_np)
+        self._harden_std(X_tr, y_tr, J_tr, X_val, y_val, rng_np,
+                         continuous=continuous, bounds=bounds)
         return self
 
-    def _harden_std(self, X_tr, y_tr, J_tr, X_val, y_val, rng_np):
+    def _continuity_mask(self, continuous) -> np.ndarray:
+        """(d_y,) bool: outputs that must be continuous across facets."""
+        if continuous is None:
+            continuous = self.continuous
+        if continuous is False or continuous is None:
+            return np.zeros(self.n_outputs_, dtype=bool)
+        affine = self.slope_mask_ > 0
+        if continuous is True:
+            if not affine.any():
+                raise ValueError(
+                    "continuous=True needs affine outputs (leaf_type='affine'); "
+                    "constant leaves can only be continuous if globally constant."
+                )
+            return affine
+        mask = np.zeros(self.n_outputs_, dtype=bool)
+        for k in continuous:
+            k = int(k)
+            if not 0 <= k < self.n_outputs_ or not affine[k]:
+                raise ValueError(
+                    f"continuous output {k} must be an affine output index."
+                )
+            mask[k] = True
+        return mask
+
+    def _std_bounds(self, bounds):
+        lo, hi = (self.x_min_, self.x_max_) if bounds is None else bounds
+        p = self.n_features_in_
+        lo = np.broadcast_to(np.asarray(lo, dtype=np.float64), (p,))
+        hi = np.broadcast_to(np.asarray(hi, dtype=np.float64), (p,))
+        return (lo - self.x_mean_) / self.x_std_, (hi - self.x_mean_) / self.x_std_
+
+    def _harden_std(self, X_tr, y_tr, J_tr, X_val, y_val, rng_np,
+                    continuous=None, bounds=None):
         """Hardening on standardized train/validation arrays."""
+        from .export import _boundary_jumps, _kept_leaves
+
+        cont = self._continuity_mask(continuous)
+        lo_s, hi_s = self._std_bounds(bounds)
         X_val_o = X_val * self.x_std_ + self.x_mean_
         y_val_o = self._unstandardize_y(y_val)
         before = self.soft_hard_gap(X_val_o, y_val_o)
@@ -431,7 +499,17 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         p = self.params_
 
         leaves = self.apply_std(X_tr)
-        new_mu, new_A, new_raw = self._refit_leaves(X_tr, y_tr, J_tr, leaves)
+        facets = None
+        if cont.any():
+            from . import _geometry
+
+            kept = _kept_leaves(self, lo_s, hi_s, 1e-7)
+            facets = _geometry.shared_facets(
+                p["W"], p["b"], self.depth, lo_s, hi_s, leaves=kept
+            )
+        new_mu, new_A, new_raw = self._refit_leaves(
+            X_tr, y_tr, J_tr, leaves, cont=cont, facets=facets
+        )
         p["leaf_mu"], p["leaf_A"], p["leaf_chol_raw"] = new_mu, new_A, new_raw
         p["log_alpha"] = np.zeros(())
         p["log_gamma"] = np.full(self.depth, np.log(self.gamma_hard))
@@ -447,18 +525,28 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             "before": before,
             "after": self.soft_hard_gap(X_val_o, y_val_o),
             "n_validation": int(X_val.shape[0]),
+            "continuous": np.flatnonzero(cont).tolist(),
+            "max_boundary_jump": _max_jump(_boundary_jumps(self, lo_s, hi_s), self.n_outputs_),
         }
         return self
 
-    def _refit_leaves(self, Xs, ys, Js, leaves):
+    def _refit_leaves(self, Xs, ys, Js, leaves, cont=None, facets=None):
         """Least-squares leaf refit on a frozen crisp partition (standardized).
 
         Returns new ``(leaf_mu, leaf_A, leaf_chol_raw)``. Coefficients are
         ridge-shrunk toward the current (soft) leaf values with strength
-        ``hard_ridge``; empty leaves keep their current values.
+        ``hard_ridge``, so leaves without training points keep their values
+        unless continuity ties them to their neighbours.
+
+        For outputs in ``cont`` the leaves are fitted jointly, subject to
+        continuity on every shared facet in ``facets``: across node ``i``'s
+        hyperplane ``W_i x + b_i = 0`` the two leaf models may differ only by
+        a multiple of ``W_i x + b_i``, i.e. ``N_i^T (theta_l - theta_r) = 0``
+        with ``N_i`` spanning the complement of ``[b_i; W_i]``.
         """
         p = self.params_
         n_lvs, d_y, n_feat = p["leaf_A"].shape
+        q = n_feat + 1
         mask = self.slope_mask_
         lam = float(self.hard_ridge)
         jw = float(self.jacobian_weight)
@@ -470,30 +558,66 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         raw = p["leaf_chol_raw"].copy()
         nu = d_y + 1.0  # prior weight (pseudo-points) on the previous covariance
 
+        # Per-leaf normal equations for theta_l = [b_l; A_l^T], (q, d_y).
+        H = np.zeros((n_lvs, q, q))
+        R = np.zeros((n_lvs, q, d_y))
+        const = mu.copy()
         for l in range(n_lvs):
             idx = np.flatnonzero(leaves == l)
             n_l = idx.size
-            if n_l == 0:
-                continue
             Xl, yl = Xs[idx], ys[idx]
-            # Affine fit: theta = [b; A^T], shape (p + 1, d_y).
             Z = np.hstack([np.ones((n_l, 1)), Xl])
             theta_prev = np.vstack([mu[l][None, :], A[l].T])
-            G = Z.T @ Z + lam * np.eye(n_feat + 1)
-            rhs = Z.T @ yl + lam * theta_prev
-            if Js is not None:
-                G[1:, 1:] += jw * n_l * np.eye(n_feat)
-                rhs[1:] += jw * Js[idx].sum(axis=0).T
-            theta = np.linalg.solve(G, rhs)
+            H[l] = Z.T @ Z + lam * np.eye(q)
+            R[l] = Z.T @ yl + lam * theta_prev
+            if Js is not None and n_l > 0:
+                H[l, 1:, 1:] += jw * n_l * np.eye(n_feat)
+                R[l, 1:] += jw * Js[idx].sum(axis=0).T
             # Constant fit for outputs whose leaves stay constant.
-            const = (yl.sum(axis=0) + lam * mu[l]) / (n_l + lam)
-            mu[l] = np.where(mask > 0, theta[0], const)
-            A[l] = theta[1:].T * mask[:, None]
+            const[l] = (yl.sum(axis=0) + lam * mu[l]) / (n_l + lam)
 
-            resid = yl - (mu[l][None, :] + Xl @ A[l].T)
-            S = (resid.T @ resid + nu * Sigma_prev[l]) / (n_l + nu)
+        theta = np.linalg.solve(H, R)  # independent per-leaf fits
+        cont = np.zeros(d_y, dtype=bool) if cont is None else cont
+        if cont.any() and facets:
+            theta[:, :, cont] = self._continuous_solve(
+                H, R[:, :, cont], facets
+            ).reshape(n_lvs, q, -1)
+
+        for l in range(n_lvs):
+            mu[l] = np.where(mask > 0, theta[l, 0], const[l])
+            A[l] = theta[l, 1:].T * mask[:, None]
+            idx = np.flatnonzero(leaves == l)
+            if idx.size == 0:
+                continue
+            resid = ys[idx] - (mu[l][None, :] + Xs[idx] @ A[l].T)
+            S = (resid.T @ resid + nu * Sigma_prev[l]) / (idx.size + nu)
             raw[l] = _chol_to_raw(np.linalg.cholesky(S))
         return mu, A, raw
+
+    def _continuous_solve(self, H, R, facets):
+        """Joint leaf fit with continuity constraints ``C theta = 0``.
+
+        ``H``: (L, q, q) per-leaf normal matrices; ``R``: (L, q, m) right-hand
+        sides for the m continuous outputs. Returns theta stacked as (L*q, m).
+        """
+        from scipy.linalg import block_diag, null_space
+
+        n_lvs, q, _ = H.shape
+        W, b = self.params_["W"], self.params_["b"]
+        rows = []
+        for f in facets:
+            N = null_space(np.r_[b[f.node], W[f.node]][None, :])  # (q, q-1)
+            Cf = np.zeros((N.shape[1], n_lvs * q))
+            Cf[:, f.left * q:(f.left + 1) * q] = N.T
+            Cf[:, f.right * q:(f.right + 1) * q] = -N.T
+            rows.append(Cf)
+        C = np.vstack(rows)
+        Hb = block_diag(*H)
+        Rb = R.reshape(n_lvs * q, -1)
+        if self.continuity_weight is not None:
+            return np.linalg.solve(Hb + float(self.continuity_weight) * C.T @ C, Rb)
+        Z = null_space(C)  # basis of continuous piecewise-affine models
+        return Z @ np.linalg.solve(Z.T @ Hb @ Z, Z.T @ Rb)
 
     def soft_hard_gap(self, X, y):
         """Compare soft and hard (crisp) predictions on ``(X, y)``.

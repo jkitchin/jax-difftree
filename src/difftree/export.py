@@ -21,6 +21,16 @@ Three entry points:
   a_k]``, the first ``p`` lifted features are the raw inputs (the leaf models
   use only these), and node ``i`` splits lifted feature ``p + j`` at ``t_i``.
 - :func:`predict_spec` evaluates such a spec in NumPy, as a reference.
+
+Two helpers deal with split boundaries, where a piecewise-affine tree can
+jump. A MILP treats leaf polytopes as closed sets, so its optimum can sit on
+a boundary and use either neighbouring leaf's model there:
+
+- :func:`boundary_jumps` measures the largest jump of each output across every
+  shared facet (use ``harden(continuous=True)`` to remove them);
+- :func:`repair_solution` moves a MILP solution a distance ``delta`` into the
+  interior of the leaf the solver chose (see :func:`leaf_from_binaries`), so
+  that ``predict(hard=True)`` at the returned point uses that leaf.
 """
 from __future__ import annotations
 
@@ -33,7 +43,7 @@ import numpy as np
 from scipy.optimize import linprog
 from sklearn.utils.validation import check_is_fitted
 
-from . import _model
+from . import _geometry, _model
 
 SPEC_VERSION = 1
 
@@ -146,36 +156,6 @@ def _leaves_original(model):
     return coef, intercept, cov
 
 
-def _leaf_path(depth: int, leaf: int) -> list:
-    """[(internal node, 'left'|'right'), ...] from the root to ``leaf``."""
-    node = _model.n_internal_nodes(depth) + leaf
-    path = []
-    while node > 0:
-        parent = (node - 1) // 2
-        path.append((parent, "left" if node == 2 * parent + 1 else "right"))
-        node = parent
-    return path[::-1]
-
-
-def _chebyshev_radius(G, h) -> float:
-    """Largest r in [0, 1] with a ball of radius r inside ``{x : G x <= h}``;
-    0 when the polytope is empty."""
-    norms = np.linalg.norm(G, axis=1)
-    n_var = G.shape[1]
-    c = np.zeros(n_var + 1)
-    c[-1] = -1.0
-    res = linprog(
-        c,
-        A_ub=np.hstack([G, norms[:, None]]),
-        b_ub=h,
-        bounds=[(None, None)] * n_var + [(0.0, 1.0)],
-        method="highs",
-    )
-    if res.status != 0:
-        return 0.0
-    return float(res.x[-1])
-
-
 # ---------------------------------------------------------------------------
 # Leaf polytopes
 # ---------------------------------------------------------------------------
@@ -243,12 +223,10 @@ def _leaf_polytopes(model, bounds, prune_empty, X, prune_unreached, tol):
 
     out = []
     for leaf in range(_model.n_leaves(depth)):
-        path = _leaf_path(depth, leaf)
-        sign = np.array([1.0 if d == "left" else -1.0 for _, d in path])
-        nodes = np.array([n for n, _ in path], dtype=int)
-        Gs = np.vstack([sign[:, None] * W[nodes], box_Gs])
-        hs = np.concatenate([-sign * b[nodes], box_hs])
-        radius = _chebyshev_radius(Gs, hs)
+        nodes, sign, Gp, hp = _geometry.path_constraints(W, b, depth, leaf)
+        path = _geometry.leaf_path(depth, leaf)
+        _, radius = _geometry.chebyshev(np.vstack([Gp, box_Gs]),
+                                        np.concatenate([hp, box_hs]))
         n_samples = None if counts is None else int(counts[leaf])
         if prune_empty and radius <= tol:
             continue
@@ -434,3 +412,156 @@ def predict_spec(spec: dict | str, X) -> np.ndarray:
     X_aug = np.hstack([np.ones((X.shape[0], 1)), Xt])
     y = np.einsum("nf,nft->nt", X_aug, params)
     return y[:, 0] if spec["n_targets"] == 1 else y
+
+
+# ---------------------------------------------------------------------------
+# Split boundaries: jumps and MILP solution repair
+# ---------------------------------------------------------------------------
+
+
+def _std_box(model, bounds):
+    lo, hi = _resolve_bounds(model, bounds)
+    return (lo - model.x_mean_) / model.x_std_, (hi - model.x_mean_) / model.x_std_
+
+
+def _kept_leaves(model, lo_s, hi_s, tol):
+    W = np.asarray(model.params_["W"], dtype=np.float64)
+    b = np.asarray(model.params_["b"], dtype=np.float64)
+    box_G, box_h = _geometry.box_constraints(lo_s, hi_s)
+    kept = []
+    for leaf in range(_model.n_leaves(model.depth)):
+        _, _, Gp, hp = _geometry.path_constraints(W, b, model.depth, leaf)
+        _, r = _geometry.chebyshev(np.vstack([Gp, box_G]), np.concatenate([hp, box_h]))
+        if r > tol:
+            kept.append(leaf)
+    return kept
+
+
+def boundary_jumps(model, bounds=None, *, tol: float = 1e-7) -> list[dict]:
+    """Largest jump of each output across every shared leaf facet in the box.
+
+    For every pair of leaves that share a (p-1)-dimensional facet inside the
+    box, the difference of their affine models is maximized (in absolute
+    value) over that facet with two LPs per output.
+
+    Parameters
+    ----------
+    model : fitted DifferentiableTreeRegressor.
+    bounds : (lo, hi), optional
+        Input box in original units; defaults to the training-data box.
+    tol : float
+        Minimum facet Chebyshev radius (standardized x units) to count.
+
+    Returns
+    -------
+    list of dict, sorted by largest jump first, each with ``node`` (internal
+    node whose hyperplane holds the facet), ``left`` / ``right`` (BFS leaf
+    indices), ``point`` (the facet's Chebyshev center, original units),
+    ``max_jump`` ((d_y,) array, original y units) and ``worst_point``
+    ((d_y, p) array: where on the facet each output's jump is largest). A
+    continuous output has ``max_jump`` at round-off level on every facet.
+    """
+    check_is_fitted(model, "params_")
+    return _boundary_jumps(model, *_std_box(model, bounds), tol)
+
+
+def _boundary_jumps(model, lo_s, hi_s, tol=1e-7):
+    P = model.params_
+    W = np.asarray(P["W"], dtype=np.float64)
+    b = np.asarray(P["b"], dtype=np.float64)
+    facets = _geometry.shared_facets(W, b, model.depth, lo_s, hi_s,
+                                     leaves=_kept_leaves(model, lo_s, hi_s, tol), tol=tol)
+    out = []
+    for f in facets:
+        jump = np.zeros(model.n_outputs_)
+        worst = np.tile(f.center, (model.n_outputs_, 1))
+        for k in range(model.n_outputs_):
+            c0 = P["leaf_mu"][f.left, k] - P["leaf_mu"][f.right, k]
+            c = P["leaf_A"][f.left, k] - P["leaf_A"][f.right, k]
+            (lo_v, lo_x), (hi_v, hi_x) = _geometry.affine_range(
+                c0, c, f.G, f.h, W[f.node][None, :], np.array([-b[f.node]])
+            )
+            v, xk = (lo_v, lo_x) if abs(lo_v) >= abs(hi_v) else (hi_v, hi_x)
+            jump[k] = abs(v) * model.y_std_[k]
+            if xk is not None:
+                worst[k] = xk
+        out.append({
+            "node": f.node,
+            "left": f.left,
+            "right": f.right,
+            "point": f.center * model.x_std_ + model.x_mean_,
+            "max_jump": jump,
+            "worst_point": worst * model.x_std_ + model.x_mean_,
+        })
+    out.sort(key=lambda d: -float(d["max_jump"].max()))
+    return out
+
+
+def leaf_from_binaries(spec: dict | str, z) -> int:
+    """BFS leaf index of the active leaf binary ``z`` of a MILP embedding.
+
+    ``z`` holds one value per leaf of ``spec``, in the order the spec's
+    leaves appear (``np.where(spec["tree"]["is_leaf"])``), which is the order
+    jax-ldt's discopt adapter uses for its leaf binaries.
+    """
+    if isinstance(spec, str):
+        spec = json.loads(spec)
+    leaf_nodes = np.flatnonzero(spec["tree"]["is_leaf"])
+    z = np.asarray(z, dtype=np.float64).ravel()
+    if z.shape[0] != leaf_nodes.shape[0]:
+        raise ValueError(f"z has {z.shape[0]} entries; spec has {leaf_nodes.shape[0]} leaves.")
+    return int(spec["difftree"]["leaf_index"][leaf_nodes[int(np.argmax(z))]])
+
+
+def repair_solution(model, x, leaf: int, *, delta: float = 1e-6, bounds=None) -> np.ndarray:
+    """Move ``x`` into the interior of ``leaf``'s polytope.
+
+    Solves one LP: the closest point (max-norm, standardized x units) to
+    ``x`` that lies at least ``delta`` inside every face of the leaf's
+    polytope within the box. Crisp routing of the result is ``leaf``, so
+    ``predict(hard=True)`` there uses the leaf model the MILP optimized,
+    and the surrogate output changes by at most ``delta`` times its slope.
+    Choose ``delta`` above the solver's feasibility tolerance (in
+    standardized units).
+
+    Parameters
+    ----------
+    model : fitted DifferentiableTreeRegressor.
+    x : (p,) array, original units (e.g. the MILP's optimal x).
+    leaf : int
+        BFS leaf index the solver selected (see :func:`leaf_from_binaries`).
+    delta : float, default 1e-6
+    bounds : (lo, hi), optional
+        Input box in original units; defaults to the training-data box.
+
+    Returns
+    -------
+    (p,) ndarray in original units.
+    """
+    check_is_fitted(model, "params_")
+    x = np.asarray(x, dtype=np.float64).ravel()
+    p = model.n_features_in_
+    W = np.asarray(model.params_["W"], dtype=np.float64)
+    b = np.asarray(model.params_["b"], dtype=np.float64)
+    lo_s, hi_s = _std_box(model, bounds)
+    _, _, Gp, hp = _geometry.path_constraints(W, b, model.depth, int(leaf))
+    box_G, box_h = _geometry.box_constraints(lo_s, hi_s)
+    G = np.vstack([Gp, box_G])
+    h = np.concatenate([hp, box_h]) - delta * np.linalg.norm(G, axis=1)
+    xs0 = (x - model.x_mean_) / model.x_std_
+    # variables [xs, s]: min s  s.t.  G xs <= h,  |xs - xs0|_inf <= s
+    eye = np.eye(p)
+    A_ub = np.block([
+        [G, np.zeros((G.shape[0], 1))],
+        [eye, -np.ones((p, 1))],
+        [-eye, -np.ones((p, 1))],
+    ])
+    b_ub = np.concatenate([h, xs0, -xs0])
+    c = np.zeros(p + 1)
+    c[-1] = 1.0
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(None, None)] * (p + 1), method="highs")
+    if res.status != 0:
+        raise ValueError(
+            f"Leaf {leaf} has no point {delta} inside all of its faces within the box."
+        )
+    return res.x[:p] * model.x_std_ + model.x_mean_
