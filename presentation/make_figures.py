@@ -54,7 +54,7 @@ def moments(params, model, X):
     Xs = (X - model.x_mean_) / model.x_std_
     m, tot, ale, rou = _model.batched_regressor_predict_moments(
         jnp.asarray(Xs), params["W"], params["b"], params["log_gamma"],
-        params["leaf_mu"], params["leaf_chol_raw"], params["log_alpha"],
+        params["leaf_mu"], params["leaf_A"], params["leaf_chol_raw"], params["log_alpha"],
     )
     ys = model.y_std_[0]
     return (np.asarray(m[:, 0]) * ys + model.y_mean_[0],
@@ -97,7 +97,7 @@ ys1 = jnp.asarray((y1[:, None] - model1.y_mean_) / model1.y_std_)
 params = _model.init_regressor_params(jax.random.PRNGKey(3), 5, 1, 1, 1.0, 1.0)
 opt = optax.adam(0.03)
 state = opt.init(params)
-mask = {k: (k != "log_gamma" and k != "log_alpha") for k in params}
+mask = {k: k not in ("log_gamma", "log_alpha", "leaf_A") for k in params}
 
 
 @jax.jit
@@ -247,7 +247,8 @@ x3 = float(x_best[2])
 def ll_raw(x):  # x in original units, (3,)
     xs = (x - jnp.asarray(mm.x_mean_)) / jnp.asarray(mm.x_std_)
     return _model.inverse_design_log_lik(xs, yt, obs, Pm["W"], Pm["b"], Pm["log_gamma"],
-                                         Pm["leaf_mu"], Pm["leaf_chol_raw"], Pm["log_alpha"])
+                                         Pm["leaf_mu"], Pm["leaf_A"], Pm["leaf_chol_raw"],
+                                         Pm["log_alpha"])
 
 
 ll_v = jax.jit(jax.vmap(ll_raw))

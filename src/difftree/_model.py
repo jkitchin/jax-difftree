@@ -4,8 +4,11 @@ Internal nodes are stored in BFS order: node i has children 2*i+1 and 2*i+2.
 At depth d (0-indexed), the BFS indices of internal nodes are
 ``2**d - 1 .. 2**(d+1) - 2``. Leaves are at depth D, BFS-indexed 0 .. 2**D - 1.
 
-Leaves are multivariate Gaussian: ``leaf_mu`` of shape ``(n_leaves, d_y)`` and
-``leaf_chol_raw`` of shape ``(n_leaves, d_y, d_y)``. The actual Cholesky
+Leaves are multivariate Gaussian with an affine mean: leaf ``l`` predicts
+``leaf_mu[l] + leaf_A[l] @ x`` with ``leaf_mu`` of shape ``(n_leaves, d_y)``
+and ``leaf_A`` of shape ``(n_leaves, d_y, p)``. Constant leaves are the special
+case ``leaf_A == 0``. The noise model is ``leaf_chol_raw`` of shape
+``(n_leaves, d_y, d_y)``. The actual Cholesky
 factor is constructed from ``leaf_chol_raw`` by taking its strictly lower
 triangle and replacing the diagonal with ``softplus(diag) + MIN_DIAG`` to
 guarantee positive-definiteness.
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import vmap
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import logsumexp
@@ -51,6 +55,43 @@ def log_path_probs(x, W, b, log_gamma):
         log_mu_right = log_mu + log_sigma
         log_mu = jnp.stack([log_mu_left, log_mu_right], axis=-1).reshape(-1)
     return log_mu
+
+
+def tied_index(depth: int) -> np.ndarray:
+    """For tied splits: the representative node (first node of its depth)
+    whose hyperplane each internal node uses, shape (n_internal,)."""
+    return np.concatenate([[2**d - 1] * 2**d for d in range(depth)]).astype(int)
+
+
+def hard_leaf_index(X, W, b, depth):
+    """Crisp routing: leaf index (BFS leaf order) for each row of ``X``.
+
+    Node ``i`` sends ``x`` right iff ``W[i] @ x + b[i] > 0`` and left otherwise.
+    This is the ``gamma -> inf`` limit of the soft routing, in which the path
+    probability concentrates on a single leaf. NumPy, float64.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    f = X @ np.asarray(W, dtype=np.float64).T + np.asarray(b, dtype=np.float64)
+    node = np.zeros(X.shape[0], dtype=np.int64)
+    rows = np.arange(X.shape[0])
+    for _ in range(depth):
+        node = 2 * node + 1 + (f[rows, node] > 0)
+    return node - n_internal_nodes(depth)
+
+
+def leaf_means(x, leaf_mu, leaf_A):
+    """Per-leaf predictive means ``leaf_mu + leaf_A @ x``, shape (n_leaves, d_y)."""
+    return leaf_mu + leaf_A @ x
+
+
+def expected_leaf_slope(x, W, b, log_gamma, leaf_A):
+    """Path-weighted leaf slope ``sum_l mu_l(x) A_l``, shape (d_y, p).
+
+    This is the Jacobian of the hardened (crisp) tree inside a leaf, averaged
+    over the soft routing. It is the target of the Jacobian-matching loss.
+    """
+    w = jnp.exp(log_path_probs(x, W, b, log_gamma))
+    return jnp.einsum("l,lyp->yp", w, leaf_A)
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +138,22 @@ def _mvn_log_density(diff, L):
 # ---------------------------------------------------------------------------
 
 
-def regressor_log_lik(x, y, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha):
+def regressor_log_lik(x, y, W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw, log_alpha):
     """log p(y|x) for one sample.
 
-    leaf_mu: (n_leaves, d_y). leaf_chol_raw: (n_leaves, d_y, d_y).
+    leaf_mu: (n_leaves, d_y). leaf_A: (n_leaves, d_y, p).
+    leaf_chol_raw: (n_leaves, d_y, d_y).
     Predictive density is a mixture of multivariate Gaussians weighted by path
     probabilities.
     """
     log_mu = log_path_probs(x, W, b, log_gamma)
     L = build_chol(leaf_chol_raw, log_alpha)
-    diff = y[None, :] - leaf_mu  # (n_leaves, d_y)
+    diff = y[None, :] - leaf_means(x, leaf_mu, leaf_A)  # (n_leaves, d_y)
     log_p = _mvn_log_density(diff, L)
     return logsumexp(log_mu + log_p)
 
 
-def regressor_predict_moments(x, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha):
+def regressor_predict_moments(x, W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw, log_alpha):
     """Predictive moments for one sample under the marginal mixture p(y|x).
 
     Returns (mean, total_cov, aleatoric_cov, routing_cov) of shapes
@@ -124,9 +166,10 @@ def regressor_predict_moments(x, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_al
     w = jnp.exp(log_mu)  # (n_leaves,)
     L = build_chol(leaf_chol_raw, log_alpha)
     Sigma = L @ jnp.swapaxes(L, -1, -2)  # (n_leaves, d, d)
-    mean = jnp.sum(w[:, None] * leaf_mu, axis=0)
+    M = leaf_means(x, leaf_mu, leaf_A)  # (n_leaves, d)
+    mean = jnp.sum(w[:, None] * M, axis=0)
     aleatoric = jnp.sum(w[:, None, None] * Sigma, axis=0)
-    delta = leaf_mu - mean  # (n_leaves, d)
+    delta = M - mean  # (n_leaves, d)
     routing = jnp.sum(
         w[:, None, None] * delta[:, :, None] * delta[:, None, :], axis=0
     )
@@ -134,14 +177,14 @@ def regressor_predict_moments(x, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_al
     return mean, total, aleatoric, routing
 
 
-def regressor_sample(x, key, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha):
+def regressor_sample(x, key, W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw, log_alpha):
     """Draw one sample y ~ p(y|x). Two-step: pick leaf by path prob, then MVN."""
     log_mu = log_path_probs(x, W, b, log_gamma)
     k1, k2 = jax.random.split(key)
     leaf_idx = jax.random.categorical(k1, log_mu)
     L = build_chol(leaf_chol_raw, log_alpha)
     L_l = L[leaf_idx]
-    mu_l = leaf_mu[leaf_idx]
+    mu_l = leaf_means(x, leaf_mu, leaf_A)[leaf_idx]
     eps = jax.random.normal(k2, mu_l.shape)
     return mu_l + L_l @ eps
 
@@ -153,6 +196,9 @@ def regressor_sample(x, key, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha)
 
 def _conditional_per_leaf(y_obs, obs_idx, unobs_idx, leaf_mu, L):
     """Per-leaf conditional moments and marginal log-density of y_obs.
+
+    ``leaf_mu`` is the per-sample leaf mean matrix (n_leaves, d_y), i.e. the
+    output of :func:`leaf_means` at the current x.
 
     Returns (cond_mu_per_leaf, cond_Sigma_per_leaf, log_p_obs_per_leaf).
     obs_idx and unobs_idx are integer 1-D arrays of static length.
@@ -179,7 +225,8 @@ def _conditional_per_leaf(y_obs, obs_idx, unobs_idx, leaf_mu, L):
 
 
 def conditional_moments(
-    x, y_obs, obs_idx, unobs_idx, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha
+    x, y_obs, obs_idx, unobs_idx, W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw,
+    log_alpha,
 ):
     """Conditional predictive mean, total covariance and log-evidence.
 
@@ -191,7 +238,7 @@ def conditional_moments(
     log_mu = log_path_probs(x, W, b, log_gamma)
     L = build_chol(leaf_chol_raw, log_alpha)
     cond_mu_l, cond_Sigma_l, log_p_obs_l = _conditional_per_leaf(
-        y_obs, obs_idx, unobs_idx, leaf_mu, L
+        y_obs, obs_idx, unobs_idx, leaf_means(x, leaf_mu, leaf_A), L
     )
     log_w = log_mu + log_p_obs_l
     log_evidence = logsumexp(log_w)
@@ -208,13 +255,13 @@ def conditional_moments(
 
 def conditional_sample(
     x, y_obs, key, obs_idx, unobs_idx,
-    W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha,
+    W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw, log_alpha,
 ):
     """Draw one sample y_unobs ~ p(y_unobs | x, y_obs)."""
     log_mu = log_path_probs(x, W, b, log_gamma)
     L = build_chol(leaf_chol_raw, log_alpha)
     cond_mu_l, cond_Sigma_l, log_p_obs_l = _conditional_per_leaf(
-        y_obs, obs_idx, unobs_idx, leaf_mu, L
+        y_obs, obs_idx, unobs_idx, leaf_means(x, leaf_mu, leaf_A), L
     )
     log_w = log_mu + log_p_obs_l
     k1, k2 = jax.random.split(key)
@@ -232,7 +279,7 @@ def conditional_sample(
 
 
 def inverse_design_log_lik(
-    x, y_target, obs_idx, W, b, log_gamma, leaf_mu, leaf_chol_raw, log_alpha
+    x, y_target, obs_idx, W, b, log_gamma, leaf_mu, leaf_A, leaf_chol_raw, log_alpha
 ):
     """log p(y_target | x) restricted to observed components.
 
@@ -241,7 +288,7 @@ def inverse_design_log_lik(
     log_mu = log_path_probs(x, W, b, log_gamma)
     L = build_chol(leaf_chol_raw, log_alpha)
     Sigma = L @ jnp.swapaxes(L, -1, -2)
-    mu_o = leaf_mu[:, obs_idx]
+    mu_o = leaf_means(x, leaf_mu, leaf_A)[:, obs_idx]
     Sigma_oo = Sigma[:, obs_idx[:, None], obs_idx[None, :]]
     L_oo = jnp.linalg.cholesky(Sigma_oo)
     diff_o = y_target[None, :] - mu_o
@@ -256,22 +303,25 @@ def inverse_design_log_lik(
 batched_log_path_probs = vmap(log_path_probs, in_axes=(0, None, None, None))
 
 batched_regressor_log_lik = vmap(
-    regressor_log_lik, in_axes=(0, 0, None, None, None, None, None, None)
+    regressor_log_lik, in_axes=(0, 0) + (None,) * 7
 )
 batched_regressor_predict_moments = vmap(
-    regressor_predict_moments, in_axes=(0, None, None, None, None, None, None)
+    regressor_predict_moments, in_axes=(0,) + (None,) * 7
 )
 batched_regressor_sample = vmap(
-    regressor_sample, in_axes=(0, 0, None, None, None, None, None, None)
+    regressor_sample, in_axes=(0, 0) + (None,) * 7
+)
+batched_expected_leaf_slope = vmap(
+    expected_leaf_slope, in_axes=(0, None, None, None, None)
 )
 
 batched_conditional_moments = vmap(
     conditional_moments,
-    in_axes=(0, 0, None, None, None, None, None, None, None, None),
+    in_axes=(0, 0) + (None,) * 9,
 )
 batched_conditional_sample = vmap(
     conditional_sample,
-    in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
+    in_axes=(0, 0, 0) + (None,) * 9,
 )
 
 
@@ -286,6 +336,7 @@ def init_regressor_params(key, depth, p, d_y, gamma_init=1.0, sigma_init=1.0):
     leaf_chol_raw is initialized with small random off-diagonal and a diagonal
     chosen so that ``softplus(diag) + MIN_DIAG ~= sigma_init``, giving each
     leaf an isotropic covariance of approximately ``sigma_init**2`` initially.
+    ``leaf_A`` (affine leaf slopes) starts at zero, i.e. constant leaves.
     """
     n_int = n_internal_nodes(depth)
     n_lvs = n_leaves(depth)
@@ -301,6 +352,7 @@ def init_regressor_params(key, depth, p, d_y, gamma_init=1.0, sigma_init=1.0):
         W=jax.random.normal(k_W, (n_int, p)) * scale,
         b=jax.random.normal(k_b, (n_int,)) * 0.01,
         leaf_mu=jax.random.normal(k_mu, (n_lvs, d_y)) * 0.1,
+        leaf_A=jnp.zeros((n_lvs, d_y, p)),
         leaf_chol_raw=raw,
         log_gamma=jnp.full((depth,), jnp.log(gamma_init)),
         log_alpha=jnp.zeros(()),

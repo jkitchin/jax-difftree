@@ -145,7 +145,15 @@ class DifferentiableTreeClassifier(ClassifierMixin, BaseEstimator):
         X = validate_data(self, X, reset=False, dtype=np.float64)
         return jnp.asarray((X - self.x_mean_) / self.x_std_)
 
-    def predict_proba(self, X, return_components: bool = False):
+    def apply(self, X) -> np.ndarray:
+        """Leaf index (0 .. 2**depth - 1, BFS leaf order) each row routes to
+        under crisp routing: node ``i`` goes right iff ``w_i . x + b_i > 0``."""
+        check_is_fitted(self, "params_")
+        X = validate_data(self, X, reset=False, dtype=np.float64)
+        Xs = (X - self.x_mean_) / self.x_std_
+        return _model.hard_leaf_index(Xs, self.params_["W"], self.params_["b"], self.depth)
+
+    def predict_proba(self, X, return_components: bool = False, hard: bool = False):
         """Predict class probabilities.
 
         Parameters
@@ -153,8 +161,21 @@ class DifferentiableTreeClassifier(ClassifierMixin, BaseEstimator):
         return_components : bool
             If True, also return aleatoric and epistemic predictive entropies
             (per sample, both shape ``(n,)``).
+        hard : bool
+            If True, route each row crisply to one leaf (see :meth:`apply`)
+            and return that leaf's class distribution. The epistemic
+            (routing) entropy is then zero.
         """
         check_is_fitted(self, "params_")
+        if hard:
+            logits = np.asarray(self.params_["leaf_logits"], dtype=np.float64)[self.apply(X)]
+            logits = logits - logits.max(axis=1, keepdims=True)
+            probs = np.exp(logits)
+            probs /= probs.sum(axis=1, keepdims=True)
+            if return_components:
+                ale = -np.sum(probs * np.log(probs + 1e-30), axis=1)
+                return probs, ale, np.zeros_like(ale)
+            return probs
         Xs = self._standardize(X)
         p = self._params_jax()
         if return_components:
@@ -167,8 +188,8 @@ class DifferentiableTreeClassifier(ClassifierMixin, BaseEstimator):
         )
         return np.asarray(jnp.exp(log_proba))
 
-    def predict(self, X):
-        proba = self.predict_proba(X)
+    def predict(self, X, hard: bool = False):
+        proba = self.predict_proba(X, hard=hard)
         idx = np.argmax(proba, axis=1)
         return self._label_encoder_.inverse_transform(idx)
 

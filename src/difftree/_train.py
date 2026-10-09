@@ -57,7 +57,12 @@ def _run_phase(
     label,
     verbose,
 ):
-    """Run one training phase. ``gamma_schedule`` is a callable epoch -> gamma."""
+    """Run one training phase. ``gamma_schedule`` is a callable epoch -> gamma.
+
+    ``y_tr`` may be an array or a tuple of arrays sharing the leading
+    (sample) axis, e.g. ``(y, dydx)`` for Jacobian matching; each batch
+    slices every member the same way.
+    """
     opt_state = optimizer.init(params)
     depth = params["log_gamma"].shape[0]
 
@@ -75,7 +80,8 @@ def _run_phase(
         epoch_loss = 0.0
         n_batches = 0
         for idx in _shuffled_batches(rng, n, batch_size):
-            params, opt_state, loss = step(params, opt_state, X_tr[idx], y_tr[idx])
+            batch_y = jax.tree.map(lambda a: a[idx], y_tr)
+            params, opt_state, loss = step(params, opt_state, X_tr[idx], batch_y)
             epoch_loss += float(loss)
             n_batches += 1
         if verbose and (epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1):
@@ -134,6 +140,36 @@ def train(
         batch_size, main_schedule, label="train", verbose=verbose,
     )
     return params
+
+
+def anneal(
+    params: dict,
+    loss_fn: Callable,
+    X_tr: jnp.ndarray,
+    y_tr,
+    *,
+    learning_rate: float,
+    batch_size: int,
+    n_epochs: int,
+    gamma_start: float,
+    gamma_end: float,
+    rng: np.random.Generator,
+    trainable_keys: tuple[str, ...],
+    verbose: bool = False,
+) -> dict:
+    """Continue training while ``gamma`` grows geometrically
+    ``gamma_start -> gamma_end``. Used by hardening to drive routing crisp."""
+    ratio = gamma_end / gamma_start
+
+    def schedule(epoch):
+        frac = epoch / max(1, n_epochs - 1)
+        return gamma_start * ratio**frac
+
+    opt = _build_optimizer(params, learning_rate, trainable_keys)
+    return _run_phase(
+        params, loss_fn, X_tr, y_tr, opt, rng, n_epochs,
+        batch_size, schedule, label="harden", verbose=verbose,
+    )
 
 
 def calibrate(
