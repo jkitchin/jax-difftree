@@ -386,3 +386,106 @@ def test_repair_solution_moves_into_chosen_leaf(hardened):
         assert export.leaf_from_binaries(spec, z) == spec["difftree"]["leaf_index"][node]
     with pytest.raises(ValueError, match="no point"):
         export.repair_solution(m, x_b, j["left"], delta=1e3)
+
+
+# ---------------------------------------------------------------------------
+# Tied splits: cheap continuity via the hinging-hyperplanes form
+# ---------------------------------------------------------------------------
+
+
+def test_hinge_normal_equations_match_stacked_least_squares():
+    from difftree import _hinge
+
+    rng = np.random.default_rng(9)
+    n, p, D, m = 40, 3, 2, 2
+    Xs = rng.normal(size=(n, p))
+    Y = rng.normal(size=(n, m))
+    J = rng.normal(size=(n, m, p))
+    Wd, bd, jw = rng.normal(size=(D, p)), rng.normal(size=D), 0.7
+    G, rhs, const = _hinge._normal_equations(Xs, Y, J, Wd, bd, jw)
+    # Explicit rows: values, then sqrt(jw) * d(features)/dx for every sample.
+    H = Xs @ Wd.T + bd
+    Phi = np.hstack([np.ones((n, 1)), Xs, np.maximum(H, 0)])
+    dPhi = np.concatenate([
+        np.zeros((n, p, 1)),
+        np.broadcast_to(np.eye(p), (n, p, p)),
+        (Wd.T[None] * (H > 0)[:, None, :]),
+    ], axis=2).reshape(n * p, -1)
+    A = np.vstack([Phi, np.sqrt(jw) * dPhi])
+    B = np.vstack([Y, np.sqrt(jw) * np.swapaxes(J, 1, 2).reshape(n * p, m)])
+    np.testing.assert_allclose(G, A.T @ A, atol=1e-10)
+    np.testing.assert_allclose(rhs, A.T @ B, atol=1e-10)
+    np.testing.assert_allclose(const, np.sum(B**2))
+
+
+def test_hinge_leaf_thetas_reproduce_hinge_model():
+    from difftree import _hinge, _model
+
+    rng = np.random.default_rng(10)
+    depth, p = 3, 2
+    Wd, bd = rng.normal(size=(depth, p)), rng.normal(size=depth)
+    coef = rng.normal(size=(p + 1 + depth, 1))
+    theta = _hinge.leaf_thetas(coef, Wd, bd, depth)
+    tie = _model.tied_index(depth)
+    reps = [2**d - 1 for d in range(depth)]
+    W, b = Wd[np.searchsorted(reps, tie)], bd[np.searchsorted(reps, tie)]
+    X = rng.normal(size=(500, p))
+    leaves = _model.hard_leaf_index(X, W, b, depth)
+    tree = np.einsum("nq,nq->n", np.hstack([np.ones((500, 1)), X]), theta[leaves, :, 0])
+    hinge = (np.hstack([np.ones((500, 1)), X, np.maximum(X @ Wd.T + bd, 0)]) @ coef)[:, 0]
+    np.testing.assert_allclose(tree, hinge, atol=1e-12)
+
+
+@pytest.fixture(scope="module")
+def kinks_3d():
+    rng = np.random.default_rng(11)
+    f = lambda X: np.abs(X[:, 0]) + X[:, 1] + np.maximum(X[:, 2], 0)
+    X = rng.uniform(-2, 2, (500, 3))
+    return X, f(X) + 0.02 * rng.normal(size=500), rng.uniform(-2, 2, (3000, 3)), f
+
+
+def test_tied_splits_share_one_hyperplane_per_depth(kinks_3d):
+    X, y, _, _ = kinks_3d
+    m = DifferentiableTreeRegressor(depth=3, n_epochs=30, leaf_type="affine",
+                                    tied_splits=True, random_state=0).fit(X, y)
+    W, b = m.params_["W"], m.params_["b"]
+    for d in range(3):
+        nodes = range(2**d - 1, 2 ** (d + 1) - 1)
+        for i in nodes:
+            np.testing.assert_array_equal(W[i], W[2**d - 1])
+            assert b[i] == b[2**d - 1]
+
+
+def test_tied_continuous_is_cheap(kinks_3d):
+    """Untied continuity collapses leaves at T-junctions; tied continuity is
+    jump-free and at least as accurate as the discontinuous tree here."""
+    X, y, X_te, f = kinks_3d
+    kw = dict(depth=3, n_epochs=60, leaf_type="affine", hardening=True,
+              n_hard_epochs=10, random_state=0)
+    rmse = lambda mod: np.sqrt(np.mean((mod.predict(X_te, hard=True) - f(X_te)) ** 2))
+    plain = DifferentiableTreeRegressor(**kw).fit(X, y)
+    untied = DifferentiableTreeRegressor(continuous=True, **kw).fit(X, y)
+    tied = DifferentiableTreeRegressor(continuous=True, tied_splits=True, **kw).fit(X, y)
+    assert tied.hardening_report_["max_boundary_jump"][0] < 1e-8
+    assert rmse(tied) < 0.02
+    assert rmse(tied) <= rmse(plain) + 0.005
+    assert rmse(tied) < 0.5 * rmse(untied)
+    # Continuity holds everywhere, not just in the box: compare across each
+    # plane well outside the training box.
+    for d in range(3):
+        i = 2**d - 1
+        w, b0 = tied.params_["W"][i] / tied.x_std_, tied.params_["b"][i]
+        x_on = tied.x_mean_ + 5.0 * np.array([1.0, -1.0, 0.5])
+        x_on = x_on - (w @ x_on - w @ tied.x_mean_ + b0) / (w @ w) * w  # project onto plane
+        side = tied.predict(np.stack([x_on - 1e-7 * w, x_on + 1e-7 * w]), hard=True)
+        assert abs(side[0] - side[1]) < 1e-4
+
+
+def test_tied_continuous_with_jacobians(kinks_3d):
+    X, y, X_te, f = kinks_3d
+    J = np.stack([np.sign(X[:, 0]), np.ones(len(X)), (X[:, 2] > 0).astype(float)], axis=1)
+    m = DifferentiableTreeRegressor(depth=2, n_epochs=40, leaf_type="affine",
+                                    hardening=True, n_hard_epochs=10, tied_splits=True,
+                                    continuous=True, random_state=0).fit(X, y, dydx=J)
+    assert m.hardening_report_["max_boundary_jump"][0] < 1e-8
+    assert np.sqrt(np.mean((m.predict(X_te, hard=True) - f(X_te)) ** 2)) < 0.05

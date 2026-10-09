@@ -38,7 +38,7 @@ def _reg_args(params) -> tuple:
     )
 
 
-def _make_regressor_loss(slope_mask, jacobian_weight: float = 0.0):
+def _make_regressor_loss(slope_mask, jacobian_weight: float = 0.0, tie=None):
     """Negative mean log-likelihood, plus an optional Jacobian-matching term.
 
     ``slope_mask`` has shape ``(d_y,)``: 1 for outputs with affine leaves and
@@ -51,6 +51,9 @@ def _make_regressor_loss(slope_mask, jacobian_weight: float = 0.0):
     crisp tree within a leaf, averaged over the soft routing, so the term
     teaches the leaf slopes without penalizing the steep transitions between
     leaves that only exist because routing is soft.
+
+    ``tie`` (from ``_model.tied_index``) makes every internal node use the
+    hyperplane of the first node at its depth (tied splits).
     """
     mask = jnp.asarray(slope_mask)[:, None]  # (d_y, 1)
 
@@ -59,6 +62,8 @@ def _make_regressor_loss(slope_mask, jacobian_weight: float = 0.0):
         if isinstance(y, tuple):
             y, J = y
         params = {**params, "leaf_A": params["leaf_A"] * mask}
+        if tie is not None:
+            params = {**params, "W": params["W"][tie], "b": params["b"][tie]}
         ll = _model.batched_regressor_log_lik(X, y, *_reg_args(params))
         out = -jnp.mean(ll)
         if J is not None:
@@ -161,9 +166,23 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         between leaves. Only for affine outputs, and only appropriate where
         the true response is continuous.
     continuity_weight : float or None, default=None
-        None enforces continuity exactly. A float instead adds a penalty
-        ``continuity_weight * ||mismatch||^2`` on the coefficient mismatch
-        (standardized units) across each shared facet, allowing small jumps.
+        Untied trees only. None enforces continuity exactly. A float instead
+        adds a penalty ``continuity_weight * ||mismatch||^2`` on the
+        coefficient mismatch (standardized units) across each shared facet,
+        allowing small jumps.
+    tied_splits : bool, default=False
+        Every internal node at the same depth shares one hyperplane (an
+        oblivious oblique tree). The partition is then an arrangement of
+        ``depth`` hyperplanes, and a continuous model on it is the hinge model
+        ``theta_0 . [1, x] + sum_d c_d max(0, w_d . x + b_d)``. With
+        ``continuous``, hardening fits that form directly and refines the
+        hyperplanes, which keeps continuity cheap. Without tied splits,
+        continuity forces leaves on either side of a deeper split to merge
+        wherever that split meets a parent boundary.
+    refine_splits : int, default=50
+        Tied trees with ``continuous`` only: maximum Powell iterations used to
+        move the hyperplanes so that the continuous fit's least-squares error
+        is smallest (0 keeps the trained hyperplanes).
     random_state : int or None
     verbose : bool
     """
@@ -192,6 +211,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         hard_ridge: float = 1e-6,
         continuous: bool | Sequence[int] = False,
         continuity_weight: float | None = None,
+        tied_splits: bool = False,
+        refine_splits: int = 50,
         random_state: int | None = None,
         verbose: bool = False,
     ):
@@ -217,6 +238,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         self.hard_ridge = hard_ridge
         self.continuous = continuous
         self.continuity_weight = continuity_weight
+        self.tied_splits = tied_splits
+        self.refine_splits = refine_splits
         self.random_state = random_state
         self.verbose = verbose
 
@@ -316,7 +339,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         if self.verbose:
             print(f"[difftree] calibrating on {X_val.shape[0]} held-out samples...")
         params = calibrate(
-            params, _make_regressor_loss(self.slope_mask_),
+            params, _make_regressor_loss(self.slope_mask_, tie=self._tie()),
             jnp.asarray(X_val), jnp.asarray(y_val),
             calibration_lr=self.calibration_lr,
             n_calibration_steps=self.n_calibration_steps,
@@ -369,13 +392,19 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
 
     def _train_loss_and_targets(self, y_tr, J_tr):
         if J_tr is None:
-            return _make_regressor_loss(self.slope_mask_), jnp.asarray(y_tr)
-        loss = _make_regressor_loss(self.slope_mask_, self.jacobian_weight)
+            return _make_regressor_loss(self.slope_mask_, tie=self._tie()), jnp.asarray(y_tr)
+        loss = _make_regressor_loss(self.slope_mask_, self.jacobian_weight, tie=self._tie())
         return loss, (jnp.asarray(y_tr), jnp.asarray(J_tr))
+
+    def _tie(self):
+        return _model.tied_index(self.depth) if self.tied_splits else None
 
     def _store_params(self, params):
         params = {k: np.asarray(v, dtype=np.float64) for k, v in params.items()}
         params["leaf_A"] = params["leaf_A"] * self.slope_mask_[None, :, None]
+        if self.tied_splits:
+            tie = self._tie()
+            params["W"], params["b"] = params["W"][tie], params["b"][tie]
         self.params_ = params
 
     # ------------------------------------------------------------------ hardening
@@ -394,7 +423,10 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
            outputs regress on ``[1, x]``, constant outputs take the mean;
            ``dydx`` rows join the least-squares system when given). With
            ``continuous``, the refit is one joint constrained least-squares
-           problem in which neighbouring leaves agree on their shared facets.
+           problem in which neighbouring leaves agree on their shared facets;
+           with ``tied_splits`` it is instead a hinging-hyperplanes fit, with
+           the hyperplanes refined (``refine_splits``), which is continuous
+           everywhere.
            Leaf noise covariances are refit from the residuals.
         4. Fit the variance scale ``alpha`` in closed form on the held-out
            validation slice under crisp routing, and set every per-depth gamma
@@ -498,17 +530,32 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         self._store_params(params)
         p = self.params_
 
-        leaves = self.apply_std(X_tr)
-        facets = None
-        if cont.any():
+        facets = theta_cont = None
+        if cont.any() and self.tied_splits:
+            # Continuous tied tree == hinge model: fit it (refining the
+            # hyperplanes) and read the leaf models off the hinge form.
+            from . import _hinge
+
+            reps = [2**d - 1 for d in range(self.depth)]
+            Wd, bd, coef = _hinge.fit_refine(
+                X_tr, y_tr[:, cont], None if J_tr is None else J_tr[:, cont],
+                p["W"][reps], p["b"][reps], float(self.jacobian_weight),
+                float(self.hard_ridge), self.refine_splits,
+            )
+            tie = self._tie()
+            p["W"], p["b"] = Wd[np.searchsorted(reps, tie)], bd[np.searchsorted(reps, tie)]
+            theta_cont = _hinge.leaf_thetas(coef, Wd, bd, self.depth)
+        elif cont.any():
             from . import _geometry
 
             kept = _kept_leaves(self, lo_s, hi_s, 1e-7)
             facets = _geometry.shared_facets(
                 p["W"], p["b"], self.depth, lo_s, hi_s, leaves=kept
             )
+        leaves = self.apply_std(X_tr)
         new_mu, new_A, new_raw = self._refit_leaves(
-            X_tr, y_tr, J_tr, leaves, cont=cont, facets=facets
+            X_tr, y_tr, J_tr, leaves, cont=cont, facets=facets,
+            theta_cont=theta_cont,
         )
         p["leaf_mu"], p["leaf_A"], p["leaf_chol_raw"] = new_mu, new_A, new_raw
         p["log_alpha"] = np.zeros(())
@@ -530,7 +577,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         }
         return self
 
-    def _refit_leaves(self, Xs, ys, Js, leaves, cont=None, facets=None):
+    def _refit_leaves(self, Xs, ys, Js, leaves, cont=None, facets=None,
+                      theta_cont=None):
         """Least-squares leaf refit on a frozen crisp partition (standardized).
 
         Returns new ``(leaf_mu, leaf_A, leaf_chol_raw)``. Coefficients are
@@ -542,7 +590,9 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         continuity on every shared facet in ``facets``: across node ``i``'s
         hyperplane ``W_i x + b_i = 0`` the two leaf models may differ only by
         a multiple of ``W_i x + b_i``, i.e. ``N_i^T (theta_l - theta_r) = 0``
-        with ``N_i`` spanning the complement of ``[b_i; W_i]``.
+        with ``N_i`` spanning the complement of ``[b_i; W_i]``. Passing
+        ``theta_cont`` ((n_leaves, q, n_cont)) instead fixes the continuous
+        outputs' leaf parameters (the tied-split hinge fit).
         """
         p = self.params_
         n_lvs, d_y, n_feat = p["leaf_A"].shape
@@ -578,7 +628,9 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
 
         theta = np.linalg.solve(H, R)  # independent per-leaf fits
         cont = np.zeros(d_y, dtype=bool) if cont is None else cont
-        if cont.any() and facets:
+        if theta_cont is not None:
+            theta[:, :, cont] = theta_cont
+        elif cont.any() and facets:
             theta[:, :, cont] = self._continuous_solve(
                 H, R[:, :, cont], facets
             ).reshape(n_lvs, q, -1)

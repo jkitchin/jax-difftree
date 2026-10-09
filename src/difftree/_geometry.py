@@ -35,7 +35,10 @@ def path_constraints(W, b, depth: int, leaf: int):
     path = leaf_path(depth, leaf)
     nodes = np.array([n for n, _ in path], dtype=int)
     sign = np.array([1.0 if d == "left" else -1.0 for _, d in path])
-    return nodes, sign, sign[:, None] * W[nodes], -sign * b[nodes]
+    # Rows are scale-invariant; unit normals keep the LPs well conditioned.
+    scale = np.linalg.norm(W[nodes], axis=1)
+    scale[scale == 0] = 1.0
+    return nodes, sign, sign[:, None] * W[nodes] / scale[:, None], -sign * b[nodes] / scale
 
 
 def box_constraints(lo, hi):

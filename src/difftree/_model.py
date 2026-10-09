@@ -57,6 +57,12 @@ def log_path_probs(x, W, b, log_gamma):
     return log_mu
 
 
+def tied_index(depth: int) -> np.ndarray:
+    """For tied splits: the representative node (first node of its depth)
+    whose hyperplane each internal node uses, shape (n_internal,)."""
+    return np.concatenate([[2**d - 1] * 2**d for d in range(depth)]).astype(int)
+
+
 def hard_leaf_index(X, W, b, depth):
     """Crisp routing: leaf index (BFS leaf order) for each row of ``X``.
 
