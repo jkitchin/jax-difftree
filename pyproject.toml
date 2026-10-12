@@ -3,6 +3,9 @@ name = "difftree"
 version = "0.1.0"
 description = "Differentiable oblique decision trees in JAX with built-in UQ"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "John R. Kitchin", email = "jkitchin@andrew.cmu.edu" }]
 dependencies = [
     "jax>=0.10.0",
     "numpy>=2.4.4",
@@ -11,11 +14,22 @@ dependencies = [
     "scipy>=1.13",
 ]
 
+[project.urls]
+Homepage = "https://github.com/jkitchin/jax-difftree"
+Documentation = "https://jkitchin.github.io/jax-difftree/"
+
 [dependency-groups]
 dev = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "pytest>=9.0.3",
+]
+docs = [
+    "furo>=2025.12.19",
+    "myst-nb>=1.4.0",
+    "sphinx>=9.0.4",
+    "sphinx-copybutton>=0.5.2",
+    "sphinxcontrib-bibtex>=2.7.0",
 ]
 
 [build-system]

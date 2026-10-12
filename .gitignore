@@ -21,3 +21,10 @@ README.pdf
 *.synctex.gz
 *.minted
 _minted*/
+
+# Sphinx build output
+docs/_build/
+docs/jupyter_execute/
+
+# Private notes (agenda items)
+notes.org

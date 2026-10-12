@@ -1,75 +1,56 @@
-#+TITLE: difftree: differentiable decision trees in JAX with built-in UQ
-#+AUTHOR: J. R. Kitchin
+#+TITLE: difftree
 #+OPTIONS: toc:nil
 
-* TODO followup on difftree
-DEADLINE: <2026-10-14 Wed +1w>
+#+html: <p align="center"><img src="docs/_static/logo.svg" width="180" alt="difftree logo"></p>
+#+html: <p align="center"><b>Differentiable decision trees in JAX with built-in uncertainty quantification</b></p>
+#+html: <p align="center"><a href="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml/badge.svg" alt="Tests"></a> <a href="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml/badge.svg" alt="Docs"></a> <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a></p>
 
-* Overview
+~difftree~ trains soft, oblique-split decision trees end to end with gradient
+descent in JAX, behind scikit-learn compatible estimators. Each leaf holds a
+Gaussian (or a multivariate Gaussian for multi-output targets), so the
+prediction at every input is a mixture of Gaussians weighted by soft path
+probabilities. That gives you a calibrated predictive variance, split into
+within-leaf (aleatoric) and between-leaf (routing) parts. For multi-output
+targets it also gives closed-form conditioning on observed outputs and
+gradient-based inverse design.
 
-~difftree~ is a JAX implementation of soft, oblique-split, gradient-trainable
-decision trees with sklearn-compatible estimators. The package is built around
-uncertainty quantification: regression leaves are heteroscedastic Gaussians (or
-multivariate Gaussians for multi-output targets), and the predictive
-distribution at each input is a mixture of Gaussians weighted by soft path
-probabilities. This structure delivers a calibrated predictive variance, a
-clean decomposition of uncertainty into within-leaf (aleatoric) and
-between-leaf (routing) components, and, for multivariate outputs, closed-form
-cross-conditioning and gradient-based inverse design as direct consequences.
+For surrogate optimization, trees can have affine leaves trained with
+optional Jacobian matching. A trained tree can be hardened into a crisp
+piecewise-affine model and exported as leaf polytopes or as a JSON spec for
+exact embedding in a mixed-integer linear program.
 
-For surrogate optimization, leaves can be affine ($A_\ell x + b_\ell$, with
-optional Jacobian matching), the soft tree can be hardened into a crisp
-piecewise-affine model, and that model exports as leaf polytopes or as the
-solver-neutral JSON spec of jax-ldt for exact MILP embedding.
+*Documentation:* https://jkitchin.github.io/jax-difftree/
 
-The implementation is closest in spirit to the end-to-end deterministic-tree
-formulation of cite:hehn2020end, with two practical departures motivated by
-UQ. First, splits are kept finitely soft at test time rather than annealed to
-hard, so soft-routing uncertainty contributes to the predictive variance.
-Second, a small post-hoc calibration step, in the same family as temperature
-scaling for classifier logits cite:guo2017calibration, jointly fits per-depth
-steepness and a scalar variance correction on a held-out validation slice by
-minimizing NLL.
+#+html: <p align="center"><img src="presentation/figures/hetero.png" width="720" alt="Learned noise and calibration"></p>
 
-The broader design space is reviewed in Ref. citenum:costa2023recent.
+* Features
 
-* Why differentiable trees
-
-Traditional decision trees cite:breiman1984cart,quinlan1986induction grow
-greedily and use hard, axis-aligned splits, which prevents joint optimization
-of the whole tree and limits the splits to one feature at a time. Several
-related lines of work make trees differentiable in some form:
-
-- Deep Neural Decision Forests cite:kontschieder2015deep wrap a probabilistic routing tree around a deep feature extractor, but inference still evaluates every leaf for every sample, defeating the conditional-data-flow advantage of trees.
-- Soft decision trees distilled from neural networks cite:frosst2017distilling and adaptive neural trees cite:tanno2019adaptive retain soft routing throughout, and do not target calibrated uncertainty directly.
-- Ref. citenum:hehn2020end propose end-to-end training of trees by annealing the steepness $\gamma$ during training so that the final inference model is hard (single root-to-leaf path per sample) while training remains differentiable. This recovers the tree's $O(\log L)$ inference cost.
-
-For UQ, the issue with annealing $\gamma \to \infty$ is that the soft-routing
-component of predictive uncertainty is destroyed. ~difftree~ keeps $\gamma$
-finite at test time and exposes the routing component explicitly, while still
-supporting hard inference (~predict(X, hard=True)~) and an explicit hardening
-step (~harden~) for users who want crisp point predictions or a MILP-embeddable
-model.
-
-Non-greedy oblique training generally has been a productive direction
-cite:norouzi2015efficient,murthy1994system, and the soft-routing formulation
-fits naturally inside it.
+- Heteroscedastic regression with predictive std, quantiles, samples, and an aleatoric/routing variance decomposition
+- Multivariate Gaussian leaves with full predictive covariance, closed-form conditionals p(y_unobs | x, y_obs), and conditional sampling
+- Inverse design: multi-start gradient ascent on log p(y_target | x) with partial targets and box bounds
+- Classification with an aleatoric/epistemic entropy decomposition
+- Post-hoc calibration of split steepness and variance scale on a held-out slice
+- Affine leaves, Jacobian (Sobolev) training, crisp hardening, and optional continuity across splits
+- MILP export as leaf polytopes or a jax-ldt JSON spec, plus tools to measure boundary jumps and repair MILP solutions
 
 * Installation
 
-#+begin_example
-git clone <repo>
-cd trees
-uv sync
-#+end_example
+#+begin_src sh
+pip install git+https://github.com/jkitchin/jax-difftree.git
+#+end_src
 
-The package depends on ~jax~, ~optax~, ~scikit-learn~, ~scipy~, and ~numpy~.
+For development:
+
+#+begin_src sh
+git clone https://github.com/jkitchin/jax-difftree.git
+cd jax-difftree
+uv sync
+uv run pytest
+#+end_src
 
 * Quickstart
 
-** Univariate regression
-
-#+begin_example
+#+begin_src python
 from difftree import DifferentiableTreeRegressor
 from sklearn.datasets import make_friedman1
 from sklearn.model_selection import train_test_split
@@ -80,377 +61,43 @@ X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=100, random_state=0)
 model = DifferentiableTreeRegressor(depth=5, n_epochs=150, random_state=0)
 model.fit(X_tr, y_tr)
 
-mean = model.predict(X_te)
 mean, std = model.predict(X_te, return_std=True)
 mean, std, std_aleatoric, std_routing = model.predict(X_te, return_components=True)
-samples = model.sample_y(X_te, n_samples=200)
 q05, q50, q95 = model.predict_quantile(X_te, q=[0.05, 0.5, 0.95])
-#+end_example
+#+end_src
 
-** Multivariate regression with cross-conditioning
+See the [[https://jkitchin.github.io/jax-difftree/quickstart.html][quickstart]] for multivariate regression, inverse design, and
+classification, and [[https://jkitchin.github.io/jax-difftree/surrogates.html][surrogates for MILP embedding]] for affine leaves,
+hardening, and export.
 
-#+begin_example
-import numpy as np
-model = DifferentiableTreeRegressor(depth=5, n_epochs=150).fit(X_tr, Y_tr)
+* Examples
 
-# Joint mean and full predictive covariance
-mean, cov = model.predict_full_cov(X_te)
+The [[file:notebooks/][notebooks]] directory has worked examples, also rendered in the docs:
 
-# Conditional p(y_unobs | x, y_obs) in closed form
-cond_mean, cond_cov, log_evidence = model.predict_conditional(
-    X_te, observed={0: Y_te[:, 0]}
-)
-cond_samples = model.sample_y_conditional(
-    X_te, observed={0: Y_te[:, 0]}, n_samples=500
-)
-#+end_example
+| Notebook                            | Topic                                                  |
+|-------------------------------------+--------------------------------------------------------|
+| [[file:notebooks/heteroscedastic_demo.ipynb][heteroscedastic_demo]]        | UQ and calibration on a saturating sensor              |
+| [[file:notebooks/multivariate_inverse_design.ipynb][multivariate_inverse_design]] | multivariate outputs, conditioning, inverse design     |
+| [[file:notebooks/piecewise_linear_milp.ipynb][piecewise_linear_milp]]       | affine leaves, hardening, MILP export, continuity      |
+| [[file:notebooks/scaling.ipynb][scaling]]                     | model size, fit and prediction cost vs depth           |
+| [[file:notebooks/failure_modes.ipynb][failure_modes]]               | seed sensitivity, local inverse design, extrapolation  |
 
-** Inverse design
+* Documentation
 
-Optimize the input vector to maximize the log-likelihood of a target
-multivariate output, with optional partial constraints and feature-box bounds:
+The docs are built with Sphinx from [[file:docs/][docs/]]:
 
-#+begin_example
-x_best, log_lik, x_all, log_liks = model.inverse_design(
-    targets={0: 1.8, 1: 1.0},  # or partial: {0: 1.8}
-    n_starts=24, n_steps=600, learning_rate=0.05,
-    bounds=(np.full(p, -1.0), np.full(p, 1.0)),
-)
-#+end_example
+#+begin_src sh
+uv sync --group docs
+uv run sphinx-build -b html docs docs/_build/html
+#+end_src
 
-** Affine leaves and Jacobian matching
+* Related work
 
-#+begin_example
-model = DifferentiableTreeRegressor(
-    depth=3,
-    leaf_type="affine",       # leaf l predicts A_l x + b_l
-    constant_outputs=[1],     # output 1 stays constant per leaf
-    jacobian_weight=1.0,
-)
-model.fit(X_tr, Y_tr, dydx=J_tr)   # J_tr: (n, d_y, p) dy/dx, optional
-mean, std = model.predict(X_te, return_std=True)
-#+end_example
+The approach is closest to the end-to-end decision trees of Hehn, Kooij, and
+Hamprecht ([[https://doi.org/10.1007/s11263-019-01237-6][IJCV 2020]]), but keeps splits finitely soft at test time so that
+routing uncertainty contributes to the predictive variance. See the [[https://jkitchin.github.io/jax-difftree/background.html][background]]
+and [[https://jkitchin.github.io/jax-difftree/references.html][references]] pages for more.
 
-All outputs share one partition, so one tree per unit operation means one set
-of binaries in a MILP. ~constant_outputs~ keeps selected outputs (e.g.
-intensive properties that enter blending) constant per leaf so that bilinear
-blend terms linearize exactly.
+* License
 
-** Crisp mode, hardening, and the soft/hard gap
-
-#+begin_example
-y_hard = model.predict(X_te, hard=True)   # route by the sign of each split
-leaves = model.apply(X_te)                # crisp leaf index per row
-
-model.harden(X_tr, Y_tr, dydx=J_tr)       # or fit with hardening=True
-model.hardening_report_["before"]         # soft vs hard on validation, pre-hardening
-model.hardening_report_["after"]          # ... and after
-model.soft_hard_gap(X_te, Y_te)           # same report on any data
-#+end_example
-
-** Export for MILP embedding
-
-#+begin_example
-from difftree import export
-
-polys = export.leaf_polytopes(model, bounds=(lo, hi), X=X_tr)
-for lp in polys:            # {x : lp.G x <= lp.h}, y = lp.coef x + lp.intercept
-    print(lp.leaf, lp.G.shape, lp.coef, lp.intercept, lp.cov)
-
-s = export.to_json(model, "tree.json", bounds=(lo, hi))  # jax-ldt v1 spec
-y = export.predict_spec(s, X_te)       # == model.predict(X_te, hard=True)
-
-# With jax-ldt installed:
-#   from jax_ldt import from_json
-#   from jax_ldt.export import embed_in_discopt_model
-#   tree = from_json(s)
-#+end_example
-
-** Split boundaries: jumps, continuity, and repairing MILP solutions
-
-#+begin_example
-export.boundary_jumps(model, bounds=(lo, hi))   # largest jump per shared facet
-
-# After a MILP solve (e.g. discopt via jax-ldt): result.x["x"], result.x["tree_z"]
-leaf = export.leaf_from_binaries(s, z)           # leaf the solver chose
-x_ok = export.repair_solution(model, x_milp, leaf, delta=1e-6)
-model.predict(x_ok[None], hard=True)             # == the MILP objective (to O(delta))
-
-# Jump-free hardened model: tie splits per depth, then harden continuously
-model = DifferentiableTreeRegressor(depth=3, leaf_type="affine", tied_splits=True,
-                                    continuous=True, hardening=True).fit(X_tr, Y_tr)
-#+end_example
-
-** Classification
-
-#+begin_example
-from difftree import DifferentiableTreeClassifier
-m = DifferentiableTreeClassifier(depth=5).fit(X_tr, y_tr)
-probs = m.predict_proba(X_te)
-probs, H_aleatoric, H_epistemic = m.predict_proba(X_te, return_components=True)
-#+end_example
-
-The entropy decomposition follows the standard mutual-information identity
-$H[\mathbb{E}_\ell \pi_\ell] = \mathbb{E}_\ell H[\pi_\ell] + I[Y; \ell \mid x]$
-used for separating aleatoric from epistemic uncertainty in Bayesian deep
-learning cite:depeweg2018decomposition.
-
-* Model
-
-The tree has fixed depth $D$ with $2^D - 1$ internal nodes and $2^D$ leaves
-in BFS order. Each internal node $i$ holds an oblique split parameterized by
-$(w_i \in \mathbb{R}^p, b_i \in \mathbb{R})$. The split function is
-
-\begin{equation*}
-s_i(x) \;=\; \sigma\!\bigl(\gamma_d \, (w_i^{\top} x + b_i)\bigr),
-\qquad
-\sigma(z) = \frac{1}{1+e^{-z}},
-\end{equation*}
-
-where $\gamma_d$ is a per-depth steepness. The probability that input $x$
-reaches leaf $\ell$ is the product of $s_i$ or $1-s_i$ along the path,
-computed in log space for numerical stability.
-
-** Leaves
-
-For univariate regression, leaf $\ell$ stores $(\mu_\ell, \sigma_\ell^2)$.
-For multivariate regression, it stores $(\mu_\ell \in \mathbb{R}^{d_y}, L_\ell)$
-where $L_\ell$ is a Cholesky factor with positive-softplus diagonal so that
-$\Sigma_\ell = L_\ell L_\ell^{\top}$ is positive-definite by construction. For
-classification, leaves hold categorical logits.
-
-With ~leaf_type="affine"~ the leaf mean becomes
-$m_\ell(x) = \mu_\ell + A_\ell x$ with $A_\ell \in \mathbb{R}^{d_y \times p}$;
-rows of $A_\ell$ listed in ~constant_outputs~ are fixed at zero. The noise
-model $\Sigma_\ell$ is unchanged, and every formula below holds with $\mu_\ell$
-replaced by $m_\ell(x)$.
-
-** Predictive distribution
-
-\begin{equation*}
-p(y \mid x) \;=\; \sum_{\ell=1}^{2^D} \mu_\ell(x) \, \mathcal{N}\!\bigl(y;\, \mu_\ell, \alpha\, L_\ell L_\ell^{\top}\bigr),
-\end{equation*}
-
-a conditional Gaussian mixture with input-dependent mixture weights, in the
-spirit of mixture density networks cite:bishop1994mdn but with a
-tree-structured parameterization of the mixture rather than a black-box neural
-network. The scalar $\alpha = \exp(\log\alpha)$ is fitted post-hoc on a
-held-out validation slice as an LLPR/temperature-scaling-style variance
-correction.
-
-** Variance decomposition
-
-By the law of total variance,
-
-\begin{equation*}
-\mathrm{Cov}[y \mid x]
-\;=\; \underbrace{\mathbb{E}_\ell\bigl[\Sigma_\ell\bigr]}_{\text{aleatoric}}
-\;+\; \underbrace{\mathrm{Cov}_\ell\bigl[\mu_\ell\bigr]}_{\text{routing}},
-\end{equation*}
-
-where the expectation and covariance are taken with respect to leaf index
-$\ell$ weighted by the path probabilities $\mu_\ell(x)$. Both pieces are
-exposed by ~predict(return_components=True)~ and by ~predict_full_cov~.
-
-** Training
-
-The loss is the negative marginal log-likelihood $-\log p(y \mid x)$ averaged
-over the training set. Adam with global gradient-norm clipping is used. A
-short warmup phase trains splits and leaf means with leaf variances frozen at
-$\sigma_\ell^2 \approx 1$ to avoid the classic variance-collapse pathology of
-heteroscedastic NLL training cite:lakshminarayanan2017simple. The steepness
-$\gamma$ is annealed from $\gamma_{\text{init}}$ to $\gamma_{\max}$ on a fixed
-per-epoch schedule during both phases, in the same spirit as cite:hehn2020end
-except that $\gamma$ is not driven to infinity, preserving soft-routing UQ at
-test time.
-
-When ~fit~ receives Jacobians $J_i = \partial y / \partial x \,|_{x_i}$, the
-loss gains a Sobolev term (in standardized units)
-
-\begin{equation*}
-\lambda \, \frac{1}{n} \sum_i \Bigl\| \textstyle\sum_\ell \mu_\ell(x_i) A_\ell - J_i \Bigr\|_F^2,
-\end{equation*}
-
-with $\lambda$ = ~jacobian_weight~ and only the affine outputs included. The
-path-weighted leaf slope $\sum_\ell \mu_\ell A_\ell$ is the Jacobian of the
-crisp tree inside a leaf, so the term teaches leaf slopes without penalizing
-the steep transitions between leaves that exist only because routing is soft.
-
-** Calibration
-
-After training, splits and leaf parameters are frozen, and a small set of
-calibration parameters (per-depth $\log\gamma$ and, for regressors,
-$\log\alpha$) are fitted by Adam on the held-out validation slice by
-minimizing NLL. This is the tree analogue of temperature scaling
-cite:guo2017calibration, a low-dimensional post-hoc rescaling that targets
-the predictive distribution's calibration without altering its mean structure.
-Empirical coverage of the resulting prediction intervals tracks nominal
-coverage closely on the test set, as demonstrated in the heteroscedastic-noise
-notebook.
-
-** Cross-conditioning and inverse design
-
-For multivariate $y$, the conditional $p(y_{\text{unobs}} \mid x, y_{\text{obs}})$
-is again a Gaussian mixture, with each leaf's component obtained by Schur
-complement on $\Sigma_\ell$ and the leaf weights re-normalized by the marginal
-density of $y_{\text{obs}}$ under each leaf. This recipe is standard for
-Gaussian mixtures and gives closed-form conditional mean and covariance and
-exact mixture sampling.
-
-Inverse design exploits the fact that the tree's likelihood
-$\log p(y_{\text{target}} \mid x)$ is end-to-end differentiable in $x$ since
-splits and leaves are smooth. We optimize $x$ by Adam ascent with multiple
-random restarts to handle the multimodality of the soft mixture surface.
-Constrained variants where only a subset of outputs are targeted are
-supported by passing a partial dict of target values.
-
-** Crisp routing and hardening
-
-Crisp routing sends $x$ right at node $i$ iff $w_i^{\top} x + b_i > 0$. This
-is the $\gamma \to \infty$ limit of the soft routing, where the path
-probability concentrates on one leaf, and it partitions the input space into
-polytopes. ~predict(hard=True)~ returns that leaf's Gaussian, so the routing
-variance is zero.
-
-~harden~ (or ~fit(..., hardening=True)~) converts the soft tree into a crisp
-model in four steps: (1) continue training while $\gamma$ grows geometrically
-from ~gamma_max~ to ~gamma_hard~ over ~n_hard_epochs~ epochs; (2) freeze the
-partition by routing each training point crisply; (3) refit each leaf by
-least squares on its points (regression on $[1, x]$ for affine outputs, the
-mean for constant ones, with Jacobian rows added when ~dydx~ is given, and
-ridge shrinkage ~hard_ridge~ toward the soft values); refit each leaf noise
-covariance from its residuals; (4) fit $\alpha$ in closed form on the
-validation slice under crisp routing. ~hardening_report_~ records
-~soft_hard_gap~ on the validation slice before and after: per-output RMSE and
-$R^2$ for soft and crisp predictions, their NLLs, the average largest leaf
-probability, and how often the most likely soft leaf is the crisp leaf. A
-large gap before hardening means the soft fit relies on blending leaves and
-is a misleading guide to the crisp model.
-
-** Export
-
-In original units, node $i$ goes left iff $a_i^{\top} x \le t_i$ with
-$a_i = w_i / s_x$ and $t_i = a_i^{\top} m_x - b_i$ (the standardization is
-undone). Leaf $\ell$ is the polytope $\{x : G_\ell x \le h_\ell\}$ formed by
-its path half-spaces and an input box, and its model is
-$y = C_\ell x + c_\ell$ with noise covariance $D \Sigma_\ell D$.
-~export.leaf_polytopes~ returns these, after one LP per leaf (Chebyshev ball)
-removes leaves with an empty interior, and optionally leaves that no row of a
-given ~X~ reaches.
-
-~export.to_spec~ / ~to_json~ emit the v1 spec of jax-ldt (~jax_ldt.export.spec~)
-with ~kind = "hyperplane_tree"~. The transform matrix is
-$[I_p \mid a_1 \cdots a_k]$, with one lifted column per kept internal node,
-and the leaf parameters use only the first $p$ (raw) columns. Pruned splits are
-collapsed into their kept child. The jax-ldt loader (~from_json~ /
-~predict_tree~) and its discopt adapter (~embed_in_discopt_model~) therefore
-consume difftree models unchanged. Extra information (bounds, BFS leaf ids,
-leaf covariances) goes under a top-level ~"difftree"~ key.
-
-** Split boundaries
-
-A crisp piecewise-affine tree can jump across a split boundary. A MILP treats
-the leaf polytopes as closed sets, so its optimum can sit on a boundary and
-use either neighbouring leaf's model there, while ~predict(hard=True)~ sends
-boundary points left. The MILP objective is then the true infimum of the
-crisp model, but the returned $x$ is on the wrong side of a measure-zero
-boundary. ~export.repair_solution~ fixes this with one LP: it returns the
-closest point (max-norm, standardized units) that lies at least $\delta$
-inside every face of the leaf the solver chose (~export.leaf_from_binaries~
-reads that leaf from the binaries), so crisp prediction there matches the
-MILP objective to $O(\delta)$. Unlike a strict-inequality margin in the MILP
-(jax-ldt's ~boundary_eps~), it leaves the formulation unchanged and so cannot
-create spurious infeasibility. If a surrogate output appears in a MILP
-constraint, the repaired point can move it by $\delta$ times its slope.
-
-A large jump is usually fitting error, and an optimizer will seek it out.
-~export.boundary_jumps~ finds every pair of leaves sharing a
-$(p-1)$-dimensional facet in the box (one LP per candidate pair) and
-maximizes the difference of their models over the facet (two LPs per
-output); ~hardening_report_["max_boundary_jump"]~ records the per-output
-maximum.
-
-~harden(..., continuous=True)~ removes the jumps. Across node $i$'s
-hyperplane the two leaf models may differ only by a multiple of
-$w_i^{\top} x + b_i$, which is $p$ linear equality constraints per shared
-facet. How expensive that is depends on the tree structure.
-
-*Untied splits (default).* The leaves are refit by one joint constrained
-least-squares problem (or with a penalty, ~continuity_weight~). This is
-costly on an oblique tree for two reasons. First, where a deeper split meets
-a parent boundary (a T-junction), both leaves of that split must agree with
-the same neighbour, which forces them to be equal unless the two hyperplanes
-coincide. Around any point where creases meet, the slope changes across them
-must cancel, so a crease cannot simply end at another crease. Second,
-continuity pins each kink to the learned split, so any error in where the
-split sits shows up directly in the predictions.
-
-*Tied splits (~tied_splits=True~).* All nodes at depth $d$ share one
-hyperplane $h_d(x) = w_d^{\top} x + b_d$ (an oblivious oblique tree), so the
-partition is an arrangement of $D$ hyperplanes and every junction is a
-crossing. The functions that are continuous on such a partition are exactly
-the hinging-hyperplanes models cite:breiman1993hinging
-
-\begin{equation*}
-f(x) \;=\; \theta_0^{\top} [1, x] \;+\; \sum_{d=1}^{D} c_d \max\bigl(0,\, h_d(x)\bigr),
-\end{equation*}
-
-a one-hidden-layer ReLU network with $D$ units. Leaf $\ell$'s model is
-$\theta_0 + \sum_{d:\, \ell \text{ right of } h_d} c_d \, [b_d; w_d]$. Hardening fits
-this form directly by least squares (with Jacobian rows when ~dydx~ is
-given) and moves the hyperplanes to reduce the error (Powell, at most
-~refine_splits~ iterations, about a second). The result is continuous
-everywhere, not only inside the box, and still exports as an ordinary tree.
-
-Crisp RMSE on held-out data (max jump at round-off for the continuous
-variants; depth 3 unless noted):
-
-| Function                        | discontinuous | continuous, untied | continuous, tied |
-|---------------------------------+---------------+--------------------+------------------|
-| $\lvert x_0 \rvert + x_1 + \max(x_2, 0)$ | 0.049         | 0.583              | 0.004            |
-| same, depth 4                   | 0.005         | 0.291              | 0.005            |
-| Gaussian bump (2 inputs)        | 0.103         | 0.227              | 0.097            |
-| same, depth 4                   | 0.075         | 0.212              | 0.087            |
-| $\sin 2x$ (1 input)             | 0.216         | 0.275              | 0.297            |
-| same, depth 4                   | 0.202         | 0.280              | 0.215            |
-
-Tied splits are the recommended way to get a jump-free surrogate. They are
-much better than untied continuity and often as good as the discontinuous
-tree, but with only $D$ hyperplanes they can be less flexible on smooth
-functions without kink structure. ~notebooks/piecewise_linear_milp.ipynb~
-plots all three variants across the worst split of the discontinuous tree.
-
-* Repository layout
-
-| File                                            | Contents                                          |
-|-------------------------------------------------+---------------------------------------------------|
-| ~src/difftree/_model.py~                        | JAX core (paths, NLL, conditionals, inverse loss) |
-| ~src/difftree/_train.py~                        | training and calibration loops                    |
-| ~src/difftree/_inverse.py~                      | gradient-ascent inverse-design driver             |
-| ~src/difftree/regressor.py~                     | sklearn-compatible regressor                      |
-| ~src/difftree/classifier.py~                    | sklearn-compatible classifier                     |
-| ~src/difftree/export.py~                        | leaf polytopes, jax-ldt spec, jumps, MILP repair  |
-| ~src/difftree/_geometry.py~                     | polytope LPs: leaf regions, shared facets         |
-| ~src/difftree/_hinge.py~                        | continuous tied trees as hinging hyperplanes      |
-| ~tests/test_basic.py~                           | univariate smoke tests                            |
-| ~tests/test_multivariate.py~                    | multivariate, conditional, inverse design tests   |
-| ~tests/test_affine_hard_export.py~              | affine leaves, Jacobians, hardening, export       |
-| ~notebooks/heteroscedastic_demo.ipynb~          | UQ demo on a saturating sensor                    |
-| ~notebooks/multivariate_inverse_design.ipynb~   | multivariate + inverse design                     |
-| ~notebooks/piecewise_linear_milp.ipynb~         | affine leaves, hardening, MILP export             |
-| ~notebooks/scaling.ipynb~                       | size, fit and prediction cost vs depth            |
-| ~notebooks/failure_modes.ipynb~                 | seeds, local inverse design, extrapolation UQ     |
-
-* Limitations and caveats
-
-- The fixed-depth full-binary structure makes JAX-friendly vectorization easy but caps practical depth around $D \le 10$ to $12$ because of the $2^D - 1$ split-parameter blowup. For larger problems, a grown-tree variant in the style of cite:hehn2020end can be added later as a separate fitter that reuses the same tree representation.
-- Splits are oblique linear by default. Non-linear splits (small CNNs or feature-attention gates) fit the same training framework but are not yet exposed as a public API.
-- Inverse design is local; multi-start ascent is the practical fallback for multimodality.
-- The exported leaf polytopes are closed, as is standard in big-M MILP formulations, so a MILP optimum can sit on a split boundary and use either neighbouring leaf's model there. ~export.repair_solution~ moves such a point into the chosen leaf (see "Split boundaries" above).
-- Continuity without tied splits costs accuracy on oblique trees in more than one dimension, because T-junctions over-constrain the leaves and the kinks are pinned to the learned splits. Use ~tied_splits=True~ with ~continuous=True~ instead. Tied splits give up some flexibility, since a depth-$D$ tree then has $D$ hyperplanes rather than $2^D - 1$.
-- A pruned spec matches ~predict(hard=True)~ only inside the export box. Pruning unreached leaves (~prune_unreached=True~) also reassigns their regions to neighbouring leaves.
-
-* References
-
-bibliographystyle:unsrtnat
-bibliography:references.bib
+~difftree~ is released under the [[file:LICENSE][MIT License]].
