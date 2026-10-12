@@ -3,7 +3,7 @@
 
 #+html: <p align="center"><img src="docs/_static/logo.svg" width="180" alt="difftree logo"></p>
 #+html: <p align="center"><b>Differentiable decision trees in JAX with built-in uncertainty quantification</b></p>
-#+html: <p align="center"><a href="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml/badge.svg" alt="Tests"></a> <a href="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml/badge.svg" alt="Docs"></a> <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a></p>
+#+html: <p align="center"><a href="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/tests.yml/badge.svg" alt="Tests"></a> <a href="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml"><img src="https://github.com/jkitchin/jax-difftree/actions/workflows/docs.yml/badge.svg" alt="Docs build"></a> <a href="https://jkitchin.github.io/jax-difftree/"><img src="https://img.shields.io/badge/docs-online-blue" alt="Documentation"></a> <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a></p>
 
 ~difftree~ trains soft, oblique-split decision trees end to end with gradient
 descent in JAX, behind scikit-learn compatible estimators. Each leaf holds a
@@ -18,8 +18,6 @@ For surrogate optimization, trees can have affine leaves trained with
 optional Jacobian matching. A trained tree can be hardened into a crisp
 piecewise-affine model and exported as leaf polytopes or as a JSON spec for
 exact embedding in a mixed-integer linear program.
-
-*Documentation:* https://jkitchin.github.io/jax-difftree/
 
 #+html: <p align="center"><img src="presentation/figures/hetero.png" width="720" alt="Learned noise and calibration"></p>
 
