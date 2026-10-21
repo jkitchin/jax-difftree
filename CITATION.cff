@@ -9,7 +9,7 @@ authors:
     affiliation: Carnegie Mellon University
 repository-code: "https://github.com/jkitchin/jax-difftree"
 version: "0.1.0"
-date-released: "2026-10-20"
+date-released: "2026-10-21"
 license: MIT
 abstract: "Differentiable soft decision trees in JAX with uncertainty quantification, scikit-learn compatible estimators, affine leaves, and MILP export."
 keywords: [JAX, decision trees, surrogate models, uncertainty quantification]

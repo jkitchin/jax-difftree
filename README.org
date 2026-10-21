@@ -96,6 +96,11 @@ Hamprecht ([[https://doi.org/10.1007/s11263-019-01237-6][IJCV 2020]]), but keeps
 routing uncertainty contributes to the predictive variance. See the [[https://jkitchin.github.io/jax-difftree/background.html][background]]
 and [[https://jkitchin.github.io/jax-difftree/references.html][references]] pages for more.
 
+* Citation
+
+If you use ~difftree~ in your work, please cite it. Citation metadata is in
+[[file:CITATION.cff][CITATION.cff]], and each release is archived on Zenodo with a DOI.
+
 * License
 
 ~difftree~ is released under the [[file:LICENSE][MIT License]].
