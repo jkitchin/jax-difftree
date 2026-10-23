@@ -116,6 +116,38 @@ are collapsed into their kept child. The jax-ldt loader (`from_json` /
 consume difftree models unchanged. Extra information (bounds, BFS leaf ids,
 leaf covariances) goes under a top-level `"difftree"` key.
 
+### Pyomo
+
+```python
+import pyomo.environ as pyo
+from difftree import export
+
+m = pyo.ConcreteModel()
+m.x = pyo.Var(range(2))
+m.y = pyo.Var(range(2))
+tree = export.to_pyomo(model, m, x=m.x, y=m.y, bounds=(lo, hi), method="bigm")
+m.obj = pyo.Objective(expr=m.y[0])
+pyo.SolverFactory("appsi_highs").solve(m)
+
+leaf = export.leaf_from_pyomo(tree)                 # BFS leaf index
+x_ok = export.repair_solution(model, [pyo.value(v) for v in m.x.values()], leaf)
+```
+
+`export.to_pyomo` (needs `pip install difftree[pyomo]`) writes the crisp tree
+as a generalized disjunctive program: leaf $\ell$ is a `Disjunct` holding its
+path half-spaces $G_\ell x \le h_\ell$ and its model $y = C_\ell x + c_\ell$,
+and a `Disjunction` makes exactly one leaf active. The input box becomes bounds
+on `x`, and each output gets the exact range of its leaf models over their
+polytopes (two LPs per leaf and output), so the big-M (`method="bigm"`) or
+convex-hull (`method="hull"`) reformulation needs no hand-picked constants.
+Existing bounds on `x` and `y` are only tightened. With `method=None` the
+disjunction is left for you to transform with the rest of the model or to pass
+to a GDP solver. The formulation uses one binary per kept leaf. The
+[Pyomo notebook](examples/pyomo_embedding) optimizes a reactor with a tree
+surrogate and refines it with a trust region. OMLT's
+linear-tree formulations assume axis-aligned splits, so they do not apply to
+difftree's oblique splits.
+
 ## Split boundaries
 
 ```python

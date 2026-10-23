@@ -60,6 +60,7 @@ limitations
 examples/heteroscedastic_demo
 examples/multivariate_inverse_design
 examples/piecewise_linear_milp
+examples/pyomo_embedding
 examples/scaling
 examples/failure_modes
 ```

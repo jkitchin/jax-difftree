@@ -10,7 +10,7 @@ root-to-leaf path intersected with an input box. Its leaf model is affine,
 ``y = coef_l x + intercept_l`` (``coef_l`` has zero rows for outputs held
 constant per leaf), with Gaussian noise covariance ``cov_l``.
 
-Three entry points:
+Four entry points:
 
 - :func:`leaf_polytopes` returns one :class:`LeafPolytope` per leaf, with
   empty leaves (one LP per leaf) and, optionally, unreached leaves pruned.
@@ -21,6 +21,10 @@ Three entry points:
   a_k]``, the first ``p`` lifted features are the raw inputs (the leaf models
   use only these), and node ``i`` splits lifted feature ``p + j`` at ``t_i``.
 - :func:`predict_spec` evaluates such a spec in NumPy, as a reference.
+- :func:`to_pyomo` adds the tree to a Pyomo model as a disjunction over its
+  leaves (one ``Disjunct`` per leaf polytope and model), reformulated as a
+  MILP with ``gdp.bigm`` or ``gdp.hull``; :func:`leaf_from_pyomo` reads the
+  active leaf back after a solve.
 
 Two helpers deal with split boundaries, where a piecewise-affine tree can
 jump. A MILP treats leaf polytopes as closed sets, so its optimum can sit on
@@ -565,3 +569,156 @@ def repair_solution(model, x, leaf: int, *, delta: float = 1e-6, bounds=None) ->
             f"Leaf {leaf} has no point {delta} inside all of its faces within the box."
         )
     return res.x[:p] * model.x_std_ + model.x_mean_
+
+
+# ---------------------------------------------------------------------------
+# Pyomo
+# ---------------------------------------------------------------------------
+
+
+def _var_list(v, n, what):
+    """A Pyomo indexed Var (in index order) or a sequence of scalar vars."""
+    items = list(v.values()) if hasattr(v, "values") else list(v)
+    if len(items) != n:
+        raise ValueError(f"{what} has {len(items)} variables; the model needs {n}.")
+    return items
+
+
+def _tighten(var, lo, hi):
+    if var.lb is None or var.lb < lo:
+        var.setlb(float(lo))
+    if var.ub is None or var.ub > hi:
+        var.setub(float(hi))
+
+
+def _output_range(lp):
+    """Exact range (d_y, 2) of each output of ``lp``'s model over its polytope."""
+    d_y = lp.coef.shape[0]
+    out = np.empty((d_y, 2))
+    free = [(None, None)] * lp.G.shape[1]
+    for k in range(d_y):
+        c = lp.coef[k]
+        if not np.any(c):
+            out[k] = lp.intercept[k]
+            continue
+        for j, s in enumerate((1.0, -1.0)):
+            res = linprog(s * c, A_ub=lp.G, b_ub=lp.h, bounds=free, method="highs")
+            if res.status != 0:
+                raise ValueError(f"Output range LP failed on leaf {lp.leaf}: {res.message}")
+            out[k, j] = s * res.fun + lp.intercept[k]
+    return out
+
+
+def to_pyomo(
+    model,
+    m=None,
+    x=None,
+    y=None,
+    bounds=None,
+    *,
+    method: str | None = "bigm",
+    name: str = "difftree",
+    prune_empty: bool = True,
+    X=None,
+    prune_unreached: bool = False,
+    tol: float = 1e-7,
+):
+    """Embed a crisp tree in a Pyomo model as a disjunction over its leaves.
+
+    Leaf ``l`` becomes a ``Disjunct`` holding its path half-spaces (``G_l x
+    <= h_l`` without the box rows) and its affine model ``y = coef_l x +
+    intercept_l``; a ``Disjunction`` makes exactly one leaf active. The input
+    box becomes bounds on ``x``, and each output gets the exact bounds of its
+    leaf models over their polytopes (one LP per leaf, output and direction),
+    so a big-M or hull reformulation needs no user-supplied constants. Bounds
+    already on ``x`` or ``y`` are only ever tightened.
+
+    Requires ``pyomo`` (``pip install difftree[pyomo]``).
+
+    Parameters
+    ----------
+    model : fitted DifferentiableTreeRegressor (ideally hardened).
+    m : pyomo Block, optional
+        Model to add the tree to; a new ``ConcreteModel`` by default.
+    x : pyomo indexed Var or sequence of p vars, optional
+        Inputs, in feature order. Created on the tree block if omitted.
+    y : pyomo indexed Var or sequence of d_y vars, optional
+        Outputs, in output order. Created on the tree block if omitted.
+    bounds : (lo, hi), optional
+        Input box in original units; defaults to the training-data box.
+    method : {"bigm", "hull", None}, default "bigm"
+        Pyomo GDP transformation applied to the tree block (``gdp.bigm`` or
+        ``gdp.hull``). ``None`` leaves the disjunction untransformed, e.g. to
+        transform the whole model yourself or use a GDP solver.
+    name : str, default "difftree"
+        Name of the tree block on ``m``.
+    prune_empty, X, prune_unreached, tol
+        Passed to :func:`leaf_polytopes`.
+
+    Returns
+    -------
+    pyomo Block ``b`` (also ``getattr(m, name)``; ``b.model()`` is ``m``)
+    with ``b.x`` / ``b.y`` (references to the input and output vars),
+    ``b.leaf`` (Disjuncts indexed by BFS leaf index, as returned by
+    ``model.apply``) and ``b.choose`` (the Disjunction). After a solve,
+    :func:`leaf_from_pyomo` gives the active leaf, to pass to
+    :func:`repair_solution`.
+    """
+    try:
+        import pyomo.environ as pyo
+        from pyomo.gdp import Disjunct, Disjunction
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("to_pyomo requires pyomo: pip install difftree[pyomo]") from e
+    if method not in ("bigm", "hull", None):
+        raise ValueError(f"method must be 'bigm', 'hull' or None, got {method!r}.")
+
+    _check_model(model)
+    polys = _leaf_polytopes(model, bounds, prune_empty, X, prune_unreached, tol)
+    lo, hi = _resolve_bounds(model, bounds)
+    p, d_y = model.n_features_in_, model.n_outputs_
+
+    if m is None:
+        m = pyo.ConcreteModel()
+    b = pyo.Block()
+    m.add_component(name, b)
+    if x is None:
+        b.x_vars = pyo.Var(range(p))
+        x = b.x_vars
+    if y is None:
+        b.y_vars = pyo.Var(range(d_y))
+        y = b.y_vars
+    xs = _var_list(x, p, "x")
+    ys = _var_list(y, d_y, "y")
+    b.x = pyo.Reference(xs)
+    b.y = pyo.Reference(ys)
+
+    for j in range(p):
+        _tighten(xs[j], lo[j], hi[j])
+    ranges = np.stack([_output_range(lp) for lp in polys])  # (L, d_y, 2)
+    for k in range(d_y):
+        _tighten(ys[k], ranges[:, k, 0].min(), ranges[:, k, 1].max())
+
+    by_leaf = {lp.leaf: lp for lp in polys}
+
+    def _leaf_rule(d, leaf):
+        lp = by_leaf[leaf]
+        n_path = lp.G.shape[0] - 2 * p  # drop the box rows: they are x bounds
+        d.region = pyo.Constraint(range(n_path), rule=lambda _, r: (
+            sum(float(lp.G[r, j]) * xs[j] for j in range(p)) <= float(lp.h[r])))
+        d.output = pyo.Constraint(range(d_y), rule=lambda _, k: (
+            ys[k] == sum(float(lp.coef[k, j]) * xs[j] for j in range(p) if lp.coef[k, j] != 0)
+            + float(lp.intercept[k])))
+
+    b.leaf = Disjunct(list(by_leaf), rule=_leaf_rule)
+    b.choose = Disjunction(expr=[b.leaf[leaf] for leaf in by_leaf])
+    if method is not None:
+        pyo.TransformationFactory(f"gdp.{method}").apply_to(m, targets=[b])
+    return b
+
+
+def leaf_from_pyomo(block) -> int:
+    """BFS leaf index of the active leaf of a solved :func:`to_pyomo` block."""
+    import pyomo.environ as pyo
+
+    vals = {leaf: pyo.value(d.binary_indicator_var) for leaf, d in block.leaf.items()}
+    return int(max(vals, key=vals.get))

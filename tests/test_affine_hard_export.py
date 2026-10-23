@@ -389,6 +389,70 @@ def test_repair_solution_moves_into_chosen_leaf(hardened):
 
 
 # ---------------------------------------------------------------------------
+# Pyomo embedding
+# ---------------------------------------------------------------------------
+
+
+def _highs():
+    pyo = pytest.importorskip("pyomo.environ")
+    solver = pyo.SolverFactory("appsi_highs")
+    if not solver.available(exception_flag=False):
+        pytest.skip("HiGHS (highspy) not available")
+    return pyo, solver
+
+
+@pytest.mark.parametrize("method", ["bigm", "hull"])
+@pytest.mark.parametrize("sense", [1, -1])
+def test_to_pyomo_optimum_matches_crisp_tree(hardened, method, sense):
+    pyo, solver = _highs()
+    m = hardened
+    b = export.to_pyomo(m, bounds=(-2, 2), method=method)
+    model = b.model()
+    model.obj = pyo.Objective(expr=sense * b.y[0])
+    solver.solve(model)
+    obj = pyo.value(model.obj)
+
+    # The MILP optimum is the best leaf model over its polytope.
+    lo, hi = np.array([v.lb for v in b.y.values()]), np.array([v.ub for v in b.y.values()])
+    assert obj == pytest.approx(lo[0] if sense == 1 else -hi[0], abs=1e-6)
+    grid = np.stack(np.meshgrid(*[np.linspace(-2, 2, 201)] * 2), -1).reshape(-1, 2)
+    assert obj <= (sense * m.predict(grid, hard=True)[:, 0]).min() + 1e-9
+
+    # After repair, crisp prediction reproduces the MILP solution.
+    x = np.array([pyo.value(v) for v in b.x.values()])
+    leaf = export.leaf_from_pyomo(b)
+    x_r = export.repair_solution(m, x, leaf, bounds=(-2, 2))
+    assert m.apply(x_r[None])[0] == leaf
+    y_milp = np.array([pyo.value(v) for v in b.y.values()])
+    np.testing.assert_allclose(m.predict(x_r[None], hard=True)[0], y_milp, atol=1e-4)
+
+
+def test_to_pyomo_user_vars_and_options(hardened):
+    pyo, solver = _highs()
+    m = hardened
+    model = pyo.ConcreteModel()
+    model.u = pyo.Var([0, 1], bounds=(-1.0, 5.0))
+    model.v = pyo.Var(["a", "b"])
+    b = export.to_pyomo(m, model, x=model.u, y=model.v, bounds=(-2, 2),
+                        method=None, name="unit")
+    assert b is model.unit
+    # x bounds only tightened, toward the box; y gets finite bounds.
+    assert (model.u[0].lb, model.u[0].ub) == (-1.0, 2.0)
+    assert all(v.lb is not None and v.ub is not None for v in model.v.values())
+    # method=None leaves the disjunction for the caller to transform.
+    assert len(list(model.component_data_objects(pyo.Constraint, active=True))) == 0
+    pyo.TransformationFactory("gdp.bigm").apply_to(model)
+    model.obj = pyo.Objective(expr=model.v["a"])
+    solver.solve(model)
+    assert pyo.value(model.u[0]) >= -1.0 - 1e-9
+    assert set(b.leaf) == {lp.leaf for lp in export.leaf_polytopes(m, bounds=(-2, 2))}
+    with pytest.raises(ValueError, match="x has 1 variables"):
+        export.to_pyomo(m, pyo.ConcreteModel(), x=[model.u[0]])
+    with pytest.raises(ValueError, match="method"):
+        export.to_pyomo(m, method="cuts")
+
+
+# ---------------------------------------------------------------------------
 # Tied splits: cheap continuity via the hinging-hyperplanes form
 # ---------------------------------------------------------------------------
 

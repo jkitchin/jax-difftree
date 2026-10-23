@@ -16,8 +16,8 @@ gradient-based inverse design.
 
 For surrogate optimization, trees can have affine leaves trained with
 optional Jacobian matching. A trained tree can be hardened into a crisp
-piecewise-affine model and exported as leaf polytopes or as a JSON spec for
-exact embedding in a mixed-integer linear program.
+piecewise-affine model and exported as leaf polytopes, a JSON spec, or a
+Pyomo model for exact embedding in a mixed-integer linear program.
 
 #+html: <p align="center"><img src="presentation/figures/hetero.png" width="720" alt="Learned noise and calibration"></p>
 
@@ -29,7 +29,7 @@ exact embedding in a mixed-integer linear program.
 - Classification with an aleatoric/epistemic entropy decomposition
 - Post-hoc calibration of split steepness and variance scale on a held-out slice
 - Affine leaves, Jacobian (Sobolev) training, crisp hardening, and optional continuity across splits
-- MILP export as leaf polytopes or a jax-ldt JSON spec, plus tools to measure boundary jumps and repair MILP solutions
+- MILP export as leaf polytopes, a jax-ldt JSON spec, or a Pyomo model, plus tools to measure boundary jumps and repair MILP solutions
 
 * Installation
 
@@ -77,6 +77,7 @@ The [[file:notebooks/][notebooks]] directory has worked examples, also rendered 
 | [[file:notebooks/heteroscedastic_demo.ipynb][heteroscedastic_demo]]        | UQ and calibration on a saturating sensor              |
 | [[file:notebooks/multivariate_inverse_design.ipynb][multivariate_inverse_design]] | multivariate outputs, conditioning, inverse design     |
 | [[file:notebooks/piecewise_linear_milp.ipynb][piecewise_linear_milp]]       | affine leaves, hardening, MILP export, continuity      |
+| [[file:notebooks/pyomo_embedding.ipynb][pyomo_embedding]]             | reactor design MILP in Pyomo, trust-region refinement  |
 | [[file:notebooks/scaling.ipynb][scaling]]                     | model size, fit and prediction cost vs depth           |
 | [[file:notebooks/failure_modes.ipynb][failure_modes]]               | seed sensitivity, local inverse design, extrapolation  |
 
