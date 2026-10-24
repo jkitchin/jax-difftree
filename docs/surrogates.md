@@ -50,7 +50,7 @@ the steep transitions between leaves that exist only because routing is soft.
 y_hard = model.predict(X_te, hard=True)   # route by the sign of each split
 leaves = model.apply(X_te)                # crisp leaf index per row
 
-model.harden(X_tr, Y_tr, dydx=J_tr)       # or fit with hardening=True
+model.harden(X_tr, Y_tr, dydx=J_tr)       # or construct with hardening=True
 model.hardening_report_["before"]         # soft vs hard on validation, pre-hardening
 model.hardening_report_["after"]          # ... and after
 model.soft_hard_gap(X_te, Y_te)           # same report on any data
@@ -62,7 +62,7 @@ probability concentrates on one leaf, and it partitions the input space into
 polytopes. `predict(hard=True)` returns that leaf's Gaussian, so the routing
 variance is zero.
 
-`harden` (or `fit(..., hardening=True)`) converts the soft tree into a crisp
+`harden` (or `hardening=True` in the constructor) converts the soft tree into a crisp
 model in four steps:
 
 1. Continue training while $\gamma$ grows geometrically from `gamma_max` to
