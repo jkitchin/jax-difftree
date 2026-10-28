@@ -30,3 +30,15 @@ $D$ hyperplanes rather than $2^D - 1$.
 A pruned spec matches `predict(hard=True)` only inside the export box.
 Pruning unreached leaves (`prune_unreached=True`) also reassigns their regions
 to neighbouring leaves.
+
+A C1 model (`smoothness=1`) is quadratic near its splits, so it has no exact
+MILP form. `to_pyomo(..., formulation="pwl", K=K)` gives a MILP that is
+within `export.pwl_error_bound(model, K)` of it, and the leaf-based exports
+refuse it. Its mean has a continuous gradient, but `predict(...,
+return_std=True)` still uses the crisp leaf covariances, so the predicted
+variance can jump at a split. The C1 fit is nonconvex and starts from the C0
+solution, so its accuracy depends on that start and on the seed. The default
+lower bound on the band half-width (`band_bounds`) rounds real kinks over a
+band of about 0.05 standardized units; lowering it sharpens them but can stop
+a smooth NLP solver from converging. The hinge-form exports (`"pwl"`,
+`"smooth"`) need every output to be continuous with tied splits.
