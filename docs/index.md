@@ -15,8 +15,11 @@ consequences.
 
 For surrogate optimization, leaves can be affine ($A_\ell x + b_\ell$, with
 optional Jacobian matching), the soft tree can be hardened into a crisp
-piecewise-affine model, and that model exports as leaf polytopes or as the
-solver-neutral JSON spec of jax-ldt for exact MILP embedding.
+piecewise-affine model, and that model exports as leaf polytopes, as the
+solver-neutral JSON spec of jax-ldt, or as a Pyomo model for exact MILP
+embedding. The crisp model can be made continuous (C0) or given a continuous
+gradient (C1). A C1 model embeds in an NLP for IPOPT, or approximately in a
+MILP with a guaranteed error bound.
 
 The implementation is closest in spirit to the end-to-end deterministic-tree
 formulation of {cite:t}`hehn2020end`, with two practical departures motivated
