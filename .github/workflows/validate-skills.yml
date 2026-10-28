@@ -1,0 +1,26 @@
+name: Validate skills
+
+on:
+  push:
+    branches: [main]
+    paths: ["skills/**", ".github/workflows/validate-skills.yml"]
+  pull_request:
+    paths: ["skills/**", ".github/workflows/validate-skills.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-skills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # knowhow is not on PyPI yet; install it from GitHub.
+      - name: Validate skills
+        run: uvx --from git+https://github.com/jkitchin/knowhow knowhow validate . --strict
