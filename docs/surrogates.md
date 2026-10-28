@@ -2,9 +2,11 @@
 
 A trained soft tree can be turned into a crisp piecewise-affine model and
 embedded exactly in a mixed-integer linear program (MILP). This page covers
-affine leaves, hardening, export, and the treatment of split boundaries. The
-[piecewise-linear MILP notebook](examples/piecewise_linear_milp) walks through
-the whole workflow with plots.
+affine leaves, hardening, export, the treatment of split boundaries,
+continuous (C0) hardening, and smooth (C1) hardening for gradient-based
+solvers. The [piecewise-linear MILP notebook](examples/piecewise_linear_milp)
+walks through the whole workflow with plots, and the
+[C0 and C1 notebook](examples/smooth_hinge_c1) covers the smooth variant.
 
 ## Affine leaves and Jacobian matching
 

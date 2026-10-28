@@ -17,7 +17,10 @@ gradient-based inverse design.
 For surrogate optimization, trees can have affine leaves trained with
 optional Jacobian matching. A trained tree can be hardened into a crisp
 piecewise-affine model and exported as leaf polytopes, a JSON spec, or a
-Pyomo model for exact embedding in a mixed-integer linear program.
+Pyomo model for exact embedding in a mixed-integer linear program. When an
+optimizer needs a continuous gradient, the tree can instead be hardened into
+a C1 model, which embeds in an NLP for IPOPT or, approximately, in a MILP
+with a guaranteed error bound.
 
 #+html: <p align="center"><img src="presentation/figures/hetero.png" width="720" alt="Learned noise and calibration"></p>
 
@@ -28,8 +31,10 @@ Pyomo model for exact embedding in a mixed-integer linear program.
 - Inverse design: multi-start gradient ascent on log p(y_target | x) with partial targets and box bounds
 - Classification with an aleatoric/epistemic entropy decomposition
 - Post-hoc calibration of split steepness and variance scale on a held-out slice
-- Affine leaves, Jacobian (Sobolev) training, crisp hardening, and optional continuity across splits
+- Affine leaves, Jacobian (Sobolev) training, crisp hardening, and optional continuity across splits (C0) or a continuous gradient (C1, ~smoothness=1~)
 - MILP export as leaf polytopes, a jax-ldt JSON spec, or a Pyomo model, plus tools to measure boundary jumps and repair MILP solutions
+- Pyomo export of tied continuous trees in hinge form: exact for C0 with one binary per depth, a piecewise-linear MILP with a guaranteed error bound for C1, or a smooth NLP for IPOPT
+- Analytic gradients of the soft and crisp models with ~predict_jacobian~
 
 * Installation
 
@@ -78,6 +83,7 @@ The [[file:notebooks/][notebooks]] directory has worked examples, also rendered 
 | [[file:notebooks/multivariate_inverse_design.ipynb][multivariate_inverse_design]] | multivariate outputs, conditioning, inverse design     |
 | [[file:notebooks/piecewise_linear_milp.ipynb][piecewise_linear_milp]]       | affine leaves, hardening, MILP export, continuity      |
 | [[file:notebooks/pyomo_embedding.ipynb][pyomo_embedding]]             | reactor design MILP in Pyomo, trust-region refinement  |
+| [[file:notebooks/smooth_hinge_c1.ipynb][smooth_hinge_c1]]             | C0 and C1 surrogates, PWL MILP with error bound, IPOPT |
 | [[file:notebooks/scaling.ipynb][scaling]]                     | model size, fit and prediction cost vs depth           |
 | [[file:notebooks/failure_modes.ipynb][failure_modes]]               | seed sensitivity, local inverse design, extrapolation  |
 
