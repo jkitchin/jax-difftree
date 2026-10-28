@@ -148,6 +148,12 @@ surrogate and refines it with a trust region. OMLT's
 linear-tree formulations assume axis-aligned splits, so they do not apply to
 difftree's oblique splits.
 
+For a tied, continuous tree (see [continuous hardening](#continuous-hardening)),
+`formulation="pwl"` writes the hinge form instead: one big-M binary per
+hyperplane that crosses the box, so about `depth` binaries rather than one
+per leaf, and the same optimum. The `"pwl"` and `"smooth"` formulations are
+also how a C1 model is embedded ([below](#smooth-c1-hardening)).
+
 ## Split boundaries
 
 ```python
@@ -240,3 +246,72 @@ tree, but with only $D$ hyperplanes they can be less flexible on smooth
 functions without kink structure. The
 [piecewise-linear MILP notebook](examples/piecewise_linear_milp) plots all
 three variants across the worst split of the discontinuous tree.
+
+### Smooth (C1) hardening
+
+A continuous tree still has a jump in its *gradient* at every split. That is
+the best a MILP can represent exactly: if two affine leaves also have equal
+gradients across a facet, they are the same affine map, so a piecewise-affine
+function with a continuous gradient is globally affine. Gradient-based solvers
+(IPOPT, L-BFGS, Newton-type inverse design) prefer a continuous gradient, and
+getting one needs pieces of degree at least 2. Two quadratic leaves meeting
+on $h(x) = 0$ have a continuous gradient only if they differ by
+$\alpha\, h(x)^2$.
+
+`smoothness=1` (with `tied_splits=True` and `continuous`) builds such a model
+from the hinge form by replacing each $\max(0, h)$ with
+
+$$
+\phi_\varepsilon(h) = \begin{cases} 0 & h \le -\varepsilon \\
+(h + \varepsilon)^2 / (4\varepsilon) & |h| < \varepsilon \\
+h & h \ge \varepsilon \end{cases}
+$$
+
+so the model equals the affine tree outside a band $|h_d| < \varepsilon_d$
+around each hyperplane and is quadratic inside it. The leaf models still
+describe the model outside the bands. Hardening first does the C0 fit, then
+fits the hyperplanes, the band half-widths (one per depth and output, within
+`band_bounds`) and the coefficients jointly (L-BFGS-B, at most
+`refine_splits` iterations, starting from wide and from narrow bands).
+`hinge_ridge` (default $10^{-2}$ for C1) keeps the fit from using nearly
+parallel hyperplanes with large coefficients of opposite sign, which barely
+change the function but inflate the error bound below. The lower end of
+`band_bounds` (default 0.05, standardized input units) caps the curvature at
+$|c_d| / (2\varepsilon_d)$. Narrower bands are C1 only in name, and IPOPT
+fails to converge on them from distant starting points.
+
+```python
+model = DifferentiableTreeRegressor(depth=4, leaf_type="affine", tied_splits=True,
+                                    continuous=True, smoothness=1,
+                                    hardening=True).fit(X, y)
+model.predict(X_new, hard=True)            # the C1 model
+model.predict_jacobian(X_new, hard=True)   # its continuous gradient
+model.hardening_report_["band_halfwidth"]  # (depth, n_continuous_outputs)
+```
+
+`predict(hard=True)` returns the C1 mean. Its `return_std` still comes from
+the crisp leaf covariances, so the variance can jump at a split even though
+the mean is C1.
+
+**Optimizing a C1 model.** It has no exact MILP form, so the leaf-based
+exports (`leaf_polytopes`, `to_spec`, `to_json` and `to_pyomo`'s default
+formulation) raise an error rather than export the leaf models. Two Pyomo
+formulations embed it instead:
+
+- `to_pyomo(model, ..., formulation="pwl", K=K)` replaces each smoothed
+  hinge by its piecewise-linear interpolant through $K + 1$ points across
+  the band. The interpolant is itself a sum of $K + 1$ hinges, so the result
+  is a MILP with one binary per hinge term that the box cuts. Since
+  $\phi_\varepsilon$ is convex, the interpolant lies above it, and the error
+  of output $k$ is in $[-\text{under}_k, \text{over}_k]$ everywhere, with
+  $\text{over} = \sum_d \max(c_d, 0)\, \varepsilon_d / (4K^2)$ and
+  $\text{under} = \sum_d \max(-c_d, 0)\, \varepsilon_d / (4K^2)$.
+  `export.pwl_error_bound(model, K)` returns the bound before you build
+  anything. It falls as $1/K^2$ and is attained at segment midpoints.
+- `to_pyomo(model, ..., formulation="smooth")` writes the C1 model itself
+  with `Expr_if` and no binaries, for IPOPT and similar NLP solvers.
+
+A natural workflow is to solve the `"pwl"` MILP globally, then start IPOPT on
+the `"smooth"` formulation from its solution. The
+[C0 and C1 notebook](examples/smooth_hinge_c1) walks through both.
+

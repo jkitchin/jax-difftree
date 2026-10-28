@@ -24,7 +24,15 @@ Four entry points:
 - :func:`to_pyomo` adds the tree to a Pyomo model as a disjunction over its
   leaves (one ``Disjunct`` per leaf polytope and model), reformulated as a
   MILP with ``gdp.bigm`` or ``gdp.hull``; :func:`leaf_from_pyomo` reads the
-  active leaf back after a solve.
+  active leaf back after a solve. For tied, continuous trees it can instead
+  write the hinge form: exact for C0 models, a piecewise-linear MILP with a
+  guaranteed error bound (:func:`pwl_error_bound`) or a smooth NLP for C1
+  models (``smoothness=1``).
+
+A C1 model is not piecewise affine, so the leaf-based exports
+(:func:`leaf_polytopes`, :func:`to_spec`, :func:`to_json` and the ``"tree"``
+formulation of :func:`to_pyomo`) refuse it rather than export its leaf models,
+which describe it only outside its bands.
 
 Two helpers deal with split boundaries, where a piecewise-affine tree can
 jump. A MILP treats leaf polytopes as closed sets, so its optimum can sit on
@@ -119,6 +127,16 @@ def _check_model(model):
         )
 
 
+def _require_tree_form(model, what):
+    if getattr(model, "smoothness_", 0) == 1:
+        raise ValueError(
+            f"{what} exports a piecewise-affine tree, but this model is C1 "
+            "(smoothness=1) and is quadratic near its splits. Use "
+            "to_pyomo(..., formulation='pwl', K=...) for a MILP approximation "
+            "with a guaranteed error bound, or formulation='smooth' for an NLP."
+        )
+
+
 def _resolve_bounds(model, bounds):
     if bounds is None:
         lo, hi = model.x_min_, model.x_max_
@@ -198,6 +216,7 @@ def leaf_polytopes(
     list of LeafPolytope, in BFS leaf order.
     """
     _check_model(model)
+    _require_tree_form(model, "leaf_polytopes")
     return _leaf_polytopes(model, bounds, prune_empty, X, prune_unreached, tol)
 
 
@@ -284,6 +303,7 @@ def to_spec(
     ignores.
     """
     _check_model(model)
+    _require_tree_form(model, "to_spec")
     leaves = _leaf_polytopes(model, bounds, prune_empty, X, prune_unreached, tol)
     lo, hi = _resolve_bounds(model, bounds)
     kept = {lp.leaf: lp for lp in leaves}
@@ -616,6 +636,8 @@ def to_pyomo(
     y=None,
     bounds=None,
     *,
+    formulation: str = "auto",
+    K: int | None = None,
     method: str | None = "bigm",
     name: str = "difftree",
     prune_empty: bool = True,
@@ -623,7 +645,32 @@ def to_pyomo(
     prune_unreached: bool = False,
     tol: float = 1e-7,
 ):
-    """Embed a crisp tree in a Pyomo model as a disjunction over its leaves.
+    """Embed a crisp tree in a Pyomo model.
+
+    ``formulation`` chooses the form:
+
+    - ``"tree"``: a disjunction over the leaves, described below. Exact for
+      any piecewise-affine (C0 or discontinuous) model.
+    - ``"pwl"``: the hinge form of a tied, continuous tree, ``y = theta_0 .
+      [1, x] + sum_d c_d max(0, h_d(x))``, with one big-M binary per hinge
+      term that changes sign inside the box (about ``depth`` binaries
+      instead of ``2**depth`` leaves). Exact for a C0 model. For a C1 model
+      each smoothed hinge is replaced by its ``K``-segment piecewise-linear
+      interpolant across the band (``K + 1`` hinge terms per depth and
+      output), which overestimates the C1 model where ``c_d > 0`` and
+      underestimates it where ``c_d < 0``, by at most
+      :func:`pwl_error_bound` everywhere.
+    - ``"smooth"``: the hinge form as an NLP with no binaries, each smoothed
+      hinge written with ``Expr_if``. C1 for a C1 model, so suitable for
+      IPOPT and similar solvers (for a C0 model it is only C0).
+    - ``"auto"`` (default): ``"tree"`` for piecewise-affine models. A C1
+      model has no exact MILP form, so ``"auto"`` raises and asks for
+      ``"pwl"`` or ``"smooth"``.
+
+    ``"pwl"`` and ``"smooth"`` need every output in hinge form
+    (``tied_splits=True`` and ``continuous`` covering all outputs).
+
+    The ``"tree"`` formulation:
 
     Leaf ``l`` becomes a ``Disjunct`` holding its path half-spaces (``G_l x
     <= h_l`` without the box rows) and its affine model ``y = coef_l x +
@@ -646,10 +693,17 @@ def to_pyomo(
         Outputs, in output order. Created on the tree block if omitted.
     bounds : (lo, hi), optional
         Input box in original units; defaults to the training-data box.
+    formulation : {"auto", "tree", "pwl", "smooth"}, default "auto"
+        See above.
+    K : int, optional
+        ``"pwl"`` with a C1 model: segments per band (required). Ignored for
+        a C0 model, whose hinge form is exact.
     method : {"bigm", "hull", None}, default "bigm"
-        Pyomo GDP transformation applied to the tree block (``gdp.bigm`` or
-        ``gdp.hull``). ``None`` leaves the disjunction untransformed, e.g. to
-        transform the whole model yourself or use a GDP solver.
+        ``"tree"`` only: Pyomo GDP transformation applied to the tree block
+        (``gdp.bigm`` or ``gdp.hull``). ``None`` leaves the disjunction
+        untransformed, e.g. to transform the whole model yourself or use a
+        GDP solver. ``"pwl"`` always uses big-M and ``"smooth"`` has no
+        binaries, so both ignore it.
     name : str, default "difftree"
         Name of the tree block on ``m``.
     prune_empty, X, prune_unreached, tol
@@ -662,7 +716,10 @@ def to_pyomo(
     ``b.leaf`` (Disjuncts indexed by BFS leaf index, as returned by
     ``model.apply``) and ``b.choose`` (the Disjunction). After a solve,
     :func:`leaf_from_pyomo` gives the active leaf, to pass to
-    :func:`repair_solution`.
+    :func:`repair_solution`. ``b.formulation`` records the formulation used.
+    A ``"pwl"`` block also has ``b.z`` (hinge term values), ``b.on`` (their
+    binaries), ``b.K`` and ``b.error_bound`` (the dict returned by
+    :func:`pwl_error_bound`).
     """
     try:
         import pyomo.environ as pyo
@@ -671,8 +728,15 @@ def to_pyomo(
         raise ImportError("to_pyomo requires pyomo: pip install difftree[pyomo]") from e
     if method not in ("bigm", "hull", None):
         raise ValueError(f"method must be 'bigm', 'hull' or None, got {method!r}.")
+    if formulation not in ("auto", "tree", "pwl", "smooth"):
+        raise ValueError(
+            f"formulation must be 'auto', 'tree', 'pwl' or 'smooth', got {formulation!r}."
+        )
 
     _check_model(model)
+    if formulation in ("pwl", "smooth"):
+        return _hinge_to_pyomo(model, m, x, y, bounds, formulation, K, name)
+    _require_tree_form(model, "to_pyomo" if formulation == "auto" else "to_pyomo(formulation='tree')")
     polys = _leaf_polytopes(model, bounds, prune_empty, X, prune_unreached, tol)
     lo, hi = _resolve_bounds(model, bounds)
     p, d_y = model.n_features_in_, model.n_outputs_
@@ -713,12 +777,162 @@ def to_pyomo(
     b.choose = Disjunction(expr=[b.leaf[leaf] for leaf in by_leaf])
     if method is not None:
         pyo.TransformationFactory(f"gdp.{method}").apply_to(m, targets=[b])
+    b.formulation = "tree"
+    return b
+
+
+def _hinge_form(model, what):
+    """The model's hinge form, checking that it covers every output."""
+    h = getattr(model, "hinge_", None)
+    if h is None or len(h["outputs"]) != model.n_outputs_:
+        raise ValueError(
+            f"{what} needs every output in hinge form: fit with tied_splits=True "
+            "and continuous=True, and harden."
+        )
+    return h
+
+
+def pwl_error_bound(model, K: int | None = None) -> dict:
+    """Guaranteed error of the ``K``-segment piecewise-linear hinge model.
+
+    For a C1 model (``smoothness=1``), replacing each smoothed hinge by its
+    interpolant through ``K + 1`` equally spaced points across the band
+    changes output ``k`` by an amount in ``[-under[k], over[k]]`` at every
+    ``x``, where ``over = sum_d max(c_d, 0) eps_d / (4 K^2)`` and ``under =
+    sum_d max(-c_d, 0) eps_d / (4 K^2)`` in original units. The bound
+    follows from the interpolation error ``phi'' L^2 / 8`` of a quadratic on
+    a segment of length ``L = 2 eps / K``, and is attained at segment
+    midpoints. For a C0 model both are zero and ``K`` is ignored.
+
+    Returns a dict with ``over``, ``under`` and ``bound = max(over, under)``,
+    each of shape (d_y,).
+    """
+    check_is_fitted(model, "params_")
+    h = _hinge_form(model, "pwl_error_bound")
+    zero = np.zeros(model.n_outputs_)
+    if h["eps"] is None:
+        return {"over": zero, "under": zero.copy(), "bound": zero.copy()}
+    if K is None or int(K) != K or K < 1:
+        raise ValueError(f"K must be a positive integer for a C1 model, got {K!r}.")
+    p = model.n_features_in_
+    c = h["coef"][p + 1 :]  # (D, m)
+    scale = model.y_std_[h["outputs"]] / (4 * int(K) ** 2)
+    over, under = zero.copy(), zero.copy()
+    over[h["outputs"]] = (np.maximum(c, 0) * h["eps"]).sum(axis=0) * scale
+    under[h["outputs"]] = (np.maximum(-c, 0) * h["eps"]).sum(axis=0) * scale
+    return {"over": over, "under": under, "bound": np.maximum(over, under)}
+
+
+def _hinge_to_pyomo(model, m, x, y, bounds, formulation, K, name):
+    """``"pwl"`` and ``"smooth"`` formulations of :func:`to_pyomo`."""
+    import pyomo.environ as pyo
+    from . import _hinge
+
+    h = _hinge_form(model, f"to_pyomo(formulation={formulation!r})")
+    smooth = h["eps"] is not None
+    if formulation == "pwl" and smooth:
+        bound = pwl_error_bound(model, K)  # validates K
+    elif formulation == "pwl":
+        bound = pwl_error_bound(model)
+    lo, hi = _resolve_bounds(model, bounds)
+    lo_s, hi_s = (lo - model.x_mean_) / model.x_std_, (hi - model.x_mean_) / model.x_std_
+    p, d_y = model.n_features_in_, model.n_outputs_
+    W, bh, coef = h["W"], h["b"], h["coef"]
+    D, q = W.shape[0], p + 1
+
+    if m is None:
+        m = pyo.ConcreteModel()
+    b = pyo.Block()
+    m.add_component(name, b)
+    if x is None:
+        b.x_vars = pyo.Var(range(p))
+        x = b.x_vars
+    if y is None:
+        b.y_vars = pyo.Var(range(d_y))
+        y = b.y_vars
+    xv = _var_list(x, p, "x")
+    yv = _var_list(y, d_y, "y")
+    b.x = pyo.Reference(xv)
+    b.y = pyo.Reference(yv)
+    for j in range(p):
+        _tighten(xv[j], lo[j], hi[j])
+
+    xs = [(xv[j] - float(model.x_mean_[j])) / float(model.x_std_[j]) for j in range(p)]
+    hexpr = [sum(float(W[d, j]) * xs[j] for j in range(p)) + float(bh[d]) for d in range(D)]
+    # Range of h_d over the box (interval arithmetic in standardized units).
+    h_lo = bh + np.minimum(W * lo_s, W * hi_s).sum(axis=1)
+    h_hi = bh + np.maximum(W * lo_s, W * hi_s).sum(axis=1)
+
+    # Hinge terms max(0, h_d - t) * a, keyed per output o (C1 bands differ
+    # per output) or shared by all outputs (C0).
+    terms = []  # (o or None, d, t, a)
+    if formulation == "pwl":
+        if smooth:
+            t_all, a = _hinge.pwl_terms(h["eps"], int(K))  # (D, m, K + 1), (K + 1,)
+            for o in range(len(h["outputs"])):
+                for d in range(D):
+                    terms += [(o, d, float(t_all[d, o, k]), float(a[k])) for k in range(int(K) + 1)]
+        else:
+            terms = [(None, d, 0.0, 1.0) for d in range(D)]
+        b.T = pyo.Set(initialize=range(len(terms)))
+        b.z = pyo.Var(b.T, within=pyo.NonNegativeReals)
+        b.on = pyo.Var(b.T, within=pyo.Binary)
+        b.hinge = pyo.ConstraintList()
+        for i, (_, d, t, _) in enumerate(terms):
+            L, U = h_lo[d] - t, h_hi[d] - t
+            g = hexpr[d] - t
+            b.z[i].setub(float(max(U, 0.0)))
+            if U <= 0:
+                b.z[i].fix(0.0)
+                b.on[i].fix(0)
+            elif L >= 0:
+                b.hinge.add(b.z[i] == g)
+                b.on[i].fix(1)
+            else:
+                b.hinge.add(b.z[i] >= g)
+                b.hinge.add(b.z[i] <= g - float(L) * (1 - b.on[i]))
+                b.hinge.add(b.z[i] <= float(U) * b.on[i])
+
+    def hinge_sum(col):
+        """sum_d c_d * (hinge d) for output column ``col`` of the hinge form."""
+        if formulation == "pwl":
+            return sum(float(coef[q + d, col]) * a * b.z[i]
+                       for i, (oo, d, _, a) in enumerate(terms) if oo is None or oo == col)
+        out = 0.0
+        for d in range(D):
+            hd = hexpr[d]
+            if smooth:
+                e = float(h["eps"][d, col])
+                ph = pyo.Expr_if(IF=hd <= -e, THEN=0.0,
+                                 ELSE=pyo.Expr_if(IF=hd >= e, THEN=hd, ELSE=(hd + e) ** 2 / (4 * e)))
+            else:
+                ph = pyo.Expr_if(IF=hd >= 0, THEN=hd, ELSE=0.0)
+            out = out + float(coef[q + d, col]) * ph
+        return out
+
+    b.output = pyo.ConstraintList()
+    for col, o in enumerate(h["outputs"]):
+        lin = float(coef[0, col]) + sum(float(coef[1 + j, col]) * xs[j] for j in range(p))
+        b.output.add(yv[o] == float(model.y_mean_[o])
+                     + float(model.y_std_[o]) * (lin + hinge_sum(col)))
+    b.formulation = formulation
+    b.K = int(K) if formulation == "pwl" and smooth else None
+    if formulation == "pwl":
+        b.error_bound = bound
+    b._difftree_model = model
     return b
 
 
 def leaf_from_pyomo(block) -> int:
-    """BFS leaf index of the active leaf of a solved :func:`to_pyomo` block."""
+    """BFS leaf index of the active leaf of a solved :func:`to_pyomo` block.
+
+    For the ``"pwl"`` and ``"smooth"`` formulations there are no leaf
+    binaries; the leaf is the crisp routing of the solved ``x``.
+    """
     import pyomo.environ as pyo
 
+    if getattr(block, "formulation", "tree") != "tree":
+        xv = np.array([[pyo.value(v) for v in block.x.values()]])
+        return int(block._difftree_model.apply(xv)[0])
     vals = {leaf: pyo.value(d.binary_indicator_var) for leaf, d in block.leaf.items()}
     return int(max(vals, key=vals.get))
