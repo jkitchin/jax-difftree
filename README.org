@@ -81,6 +81,20 @@ The [[file:notebooks/][notebooks]] directory has worked examples, also rendered 
 | [[file:notebooks/scaling.ipynb][scaling]]                     | model size, fit and prediction cost vs depth           |
 | [[file:notebooks/failure_modes.ipynb][failure_modes]]               | seed sensitivity, local inverse design, extrapolation  |
 
+* Agent skill
+
+The repository includes an [[https://agentskills.io/specification][Agent Skills]] skill, [[file:skills/difftree/SKILL.md][skills/difftree]], that teaches coding
+agents (Claude Code, Codex, OpenCode, Gemini CLI, Cursor, Copilot) how to use
+~difftree~ for uncertainty quantification and optimization surrogates. Install
+it into a project with [[https://github.com/jkitchin/knowhow][knowhow]] or ~npx skills~:
+
+#+begin_src sh
+uvx --from git+https://github.com/jkitchin/knowhow knowhow add jkitchin/jax-difftree --skill difftree
+# or: npx skills add jkitchin/jax-difftree --skill difftree
+#+end_src
+
+Add ~-g~ to install it for all projects.
+
 * Documentation
 
 The docs are built with Sphinx from [[file:docs/][docs/]]:

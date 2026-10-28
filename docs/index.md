@@ -61,6 +61,7 @@ examples/heteroscedastic_demo
 examples/multivariate_inverse_design
 examples/piecewise_linear_milp
 examples/pyomo_embedding
+examples/smooth_hinge_c1
 examples/scaling
 examples/failure_modes
 ```

@@ -26,7 +26,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.model_selection import train_test_split
 from sklearn.utils.validation import check_is_fitted, validate_data
 
-from . import _inverse, _model
+from . import _hinge, _inverse, _model
 from ._train import anneal, calibrate, train
 
 
@@ -180,9 +180,41 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         continuity forces leaves on either side of a deeper split to merge
         wherever that split meets a parent boundary.
     refine_splits : int, default=50
-        Tied trees with ``continuous`` only: maximum Powell iterations used to
-        move the hyperplanes so that the continuous fit's least-squares error
-        is smallest (0 keeps the trained hyperplanes).
+        Tied trees with ``continuous`` only: maximum iterations used to move
+        the hyperplanes so that the continuous fit's least-squares error is
+        smallest (0 keeps the trained hyperplanes). The C0 fit uses Powell;
+        with ``smoothness=1`` the smoothed fit that follows uses L-BFGS-B with
+        the same cap (with 0, only the band widths are fitted, in at most 100
+        iterations).
+    smoothness : {0, 1}, default=0
+        How smoothly the ``continuous`` outputs join across splits. 0: C0, a
+        continuous piecewise-affine model (exactly MILP-representable). 1:
+        C1, a continuous gradient. C1 needs ``tied_splits=True`` and
+        ``continuous``: each ``max(0, h_d)`` of the hinge model is replaced by
+        a piecewise quadratic that equals it outside a band ``|h_d| <
+        eps_d`` around the hyperplane, so the model is the affine tree
+        outside the bands and quadratic inside them. One band half-width is
+        fitted per depth and output. The leaf models (``leaf_mu``,
+        ``leaf_A``) describe the model outside the bands, and ``hinge_``
+        holds the hinge form in standardized units (``outputs``, ``W``,
+        ``b``, ``eps`` (depth, n_outputs), ``coef``). A C1 model has no
+        exact MILP form; see :func:`difftree.export.to_pyomo` for a
+        piecewise-linear approximation with a guaranteed error bound or an
+        NLP formulation.
+    band_bounds : (float, float), default=(0.05, 3.0)
+        ``smoothness=1`` only: bounds on each band half-width, as a distance
+        in standardized input space. The lower bound caps the curvature
+        (``|c_d| / (2 eps_d)`` across the band). A band much narrower than
+        this is C1 only in name: a gradient that turns over a very short
+        distance looks like a kink to a smooth NLP solver, which can then
+        fail to converge. Lower it to fit real kinks more sharply.
+    hinge_ridge : float or None, default=None
+        Ridge on the hinge coefficients of a tied continuous fit (standardized
+        units). It keeps the fit from using nearly parallel hyperplanes with
+        large coefficients of opposite sign, which barely change the function
+        but inflate big-M constants and piecewise-linear error bounds. None
+        means 1e-2 with ``smoothness=1`` and ``hard_ridge`` (unchanged
+        behaviour) with ``smoothness=0``.
     random_state : int or None
     verbose : bool
     """
@@ -213,6 +245,9 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         continuity_weight: float | None = None,
         tied_splits: bool = False,
         refine_splits: int = 50,
+        smoothness: int = 0,
+        band_bounds: tuple[float, float] = (0.05, 3.0),
+        hinge_ridge: float | None = None,
         random_state: int | None = None,
         verbose: bool = False,
     ):
@@ -240,6 +275,9 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         self.continuity_weight = continuity_weight
         self.tied_splits = tied_splits
         self.refine_splits = refine_splits
+        self.smoothness = smoothness
+        self.band_bounds = band_bounds
+        self.hinge_ridge = hinge_ridge
         self.random_state = random_state
         self.verbose = verbose
 
@@ -262,6 +300,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             raise ValueError(
                 f"leaf_type must be 'constant' or 'affine', got {self.leaf_type!r}"
             )
+        self._check_smoothness(self.smoothness, self.continuous)
         # Allow both 1D and 2D y. Track whether the user gave us 1D so that
         # predict() can return matching shape.
         y_arr = np.asarray(y)
@@ -349,6 +388,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
 
         self._store_params(params)
         self.hardened_ = False
+        self.smoothness_ = 0
+        self.hinge_ = None
         if self.hardening:
             self._harden_std(X_tr, y_tr, J_tr, X_val, y_val, rng_np)
         return self
@@ -409,7 +450,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
 
     # ------------------------------------------------------------------ hardening
 
-    def harden(self, X, y, dydx=None, *, continuous=None, bounds=None):
+    def harden(self, X, y, dydx=None, *, continuous=None, smoothness=None, bounds=None):
         """Turn the fitted soft tree into a crisp piecewise model.
 
         Steps:
@@ -426,7 +467,8 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
            problem in which neighbouring leaves agree on their shared facets;
            with ``tied_splits`` it is instead a hinging-hyperplanes fit, with
            the hyperplanes refined (``refine_splits``), which is continuous
-           everywhere.
+           everywhere. With ``smoothness=1`` that fit is then smoothed into a
+           C1 model (see the ``smoothness`` parameter).
            Leaf noise covariances are refit from the residuals.
         4. Fit the variance scale ``alpha`` in closed form on the held-out
            validation slice under crisp routing, and set every per-depth gamma
@@ -438,9 +480,14 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         validation slice before and after hardening is stored in
         ``hardening_report_`` (see :meth:`soft_hard_gap`), together with
         ``max_boundary_jump``, the largest jump of each output across any
-        shared facet in the box (see :func:`difftree.export.boundary_jumps`).
+        shared facet in the box (see :func:`difftree.export.boundary_jumps`),
+        ``max_gradient_jump``, the largest change of each output's gradient
+        across those facets (0 for C1 outputs), and ``smoothness``. A C1
+        model also reports ``band_halfwidth`` (depth, n_continuous_outputs),
+        in standardized input units.
 
-        ``continuous`` overrides the constructor setting for this call.
+        ``continuous`` and ``smoothness`` override the constructor settings
+        for this call.
         ``bounds = (lo, hi)`` (original units) sets the box in which leaves
         must join up continuously; it defaults to the training-data box and
         should cover the region a MILP will search.
@@ -466,7 +513,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
                 Xs, ys, Js, test_size=self.validation_fraction, random_state=seed
             )
         self._harden_std(X_tr, y_tr, J_tr, X_val, y_val, rng_np,
-                         continuous=continuous, bounds=bounds)
+                         continuous=continuous, smoothness=smoothness, bounds=bounds)
         return self
 
     def _continuity_mask(self, continuous) -> np.ndarray:
@@ -493,6 +540,20 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             mask[k] = True
         return mask
 
+    def _check_smoothness(self, smoothness, continuous):
+        if smoothness not in (0, 1):
+            raise ValueError(f"smoothness must be 0 or 1, got {smoothness!r}.")
+        if smoothness == 1:
+            if not self.tied_splits:
+                raise ValueError("smoothness=1 requires tied_splits=True.")
+            if continuous is False or continuous is None:
+                raise ValueError("smoothness=1 requires continuous outputs (continuous=...).")
+
+    def _hinge_ridge(self, smoothness) -> float:
+        if self.hinge_ridge is not None:
+            return float(self.hinge_ridge)
+        return 1e-2 if smoothness == 1 else float(self.hard_ridge)
+
     def _std_bounds(self, bounds):
         lo, hi = (self.x_min_, self.x_max_) if bounds is None else bounds
         p = self.n_features_in_
@@ -501,11 +562,18 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         return (lo - self.x_mean_) / self.x_std_, (hi - self.x_mean_) / self.x_std_
 
     def _harden_std(self, X_tr, y_tr, J_tr, X_val, y_val, rng_np,
-                    continuous=None, bounds=None):
+                    continuous=None, smoothness=None, bounds=None):
         """Hardening on standardized train/validation arrays."""
         from .export import _boundary_jumps, _kept_leaves
 
+        if continuous is None:
+            continuous = self.continuous
+        if smoothness is None:
+            smoothness = self.smoothness
+        self._check_smoothness(smoothness, continuous)
         cont = self._continuity_mask(continuous)
+        self.smoothness_ = 0
+        self.hinge_ = None
         lo_s, hi_s = self._std_bounds(bounds)
         X_val_o = X_val * self.x_std_ + self.x_mean_
         y_val_o = self._unstandardize_y(y_val)
@@ -534,17 +602,28 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         if cont.any() and self.tied_splits:
             # Continuous tied tree == hinge model: fit it (refining the
             # hyperplanes) and read the leaf models off the hinge form.
-            from . import _hinge
-
             reps = [2**d - 1 for d in range(self.depth)]
+            Y_c = y_tr[:, cont]
+            J_c = None if J_tr is None else J_tr[:, cont]
+            jw = float(self.jacobian_weight)
+            hr = None if self.hinge_ridge is None and smoothness == 0 else self._hinge_ridge(smoothness)
             Wd, bd, coef = _hinge.fit_refine(
-                X_tr, y_tr[:, cont], None if J_tr is None else J_tr[:, cont],
-                p["W"][reps], p["b"][reps], float(self.jacobian_weight),
-                float(self.hard_ridge), self.refine_splits,
+                X_tr, Y_c, J_c, p["W"][reps], p["b"][reps], jw,
+                float(self.hard_ridge), self.refine_splits, hinge_ridge=hr,
             )
+            eps = None
+            if smoothness == 1:
+                Wd, bd, eps, coef = _hinge.smooth_fit(
+                    X_tr, Y_c, J_c, Wd, bd, jw, float(self.hard_ridge),
+                    self._hinge_ridge(1), self.band_bounds, self.refine_splits,
+                )
             tie = self._tie()
             p["W"], p["b"] = Wd[np.searchsorted(reps, tie)], bd[np.searchsorted(reps, tie)]
+            # Leaf models: the hinge model (the C1 model outside its bands).
             theta_cont = _hinge.leaf_thetas(coef, Wd, bd, self.depth)
+            self.hinge_ = {"outputs": np.flatnonzero(cont), "W": Wd, "b": bd,
+                           "eps": eps, "coef": coef}
+            self.smoothness_ = int(smoothness)
         elif cont.any():
             from . import _geometry
 
@@ -553,9 +632,13 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
                 p["W"], p["b"], self.depth, lo_s, hi_s, leaves=kept
             )
         leaves = self.apply_std(X_tr)
+        smooth_tr = None
+        if self.smoothness_ == 1:
+            h = self.hinge_
+            smooth_tr = _hinge.smooth_predict(X_tr, h["W"], h["b"], h["eps"], h["coef"])
         new_mu, new_A, new_raw = self._refit_leaves(
             X_tr, y_tr, J_tr, leaves, cont=cont, facets=facets,
-            theta_cont=theta_cont,
+            theta_cont=theta_cont, fitted_cont=smooth_tr,
         )
         p["leaf_mu"], p["leaf_A"], p["leaf_chol_raw"] = new_mu, new_A, new_raw
         p["log_alpha"] = np.zeros(())
@@ -566,6 +649,7 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         mean_v, cov_v = self._hard_moments_std(X_val)
         z2 = _mahalanobis_sq(y_val - mean_v, cov_v)
         p["log_alpha"] = np.asarray(np.log(max(z2.mean() / self.n_outputs_, 1e-12)))
+        jumps = _boundary_jumps(self, lo_s, hi_s)
 
         self.hardened_ = True
         self.hardening_report_ = {
@@ -573,12 +657,29 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             "after": self.soft_hard_gap(X_val_o, y_val_o),
             "n_validation": int(X_val.shape[0]),
             "continuous": np.flatnonzero(cont).tolist(),
-            "max_boundary_jump": _max_jump(_boundary_jumps(self, lo_s, hi_s), self.n_outputs_),
+            "max_boundary_jump": _max_jump(jumps, self.n_outputs_),
+            "max_gradient_jump": self._max_gradient_jump(jumps),
+            "smoothness": self.smoothness_,
         }
+        if self.smoothness_ == 1:
+            # Band half-widths as distances in standardized input space.
+            n = np.linalg.norm(self.hinge_["W"], axis=1)
+            self.hardening_report_["band_halfwidth"] = self.hinge_["eps"] / n[:, None]
         return self
 
+    def _max_gradient_jump(self, jumps) -> np.ndarray:
+        """(d_y,) largest change of each output's gradient (2-norm, original
+        units) across the shared facets in ``jumps``; 0 for C1 outputs."""
+        out = np.zeros(self.n_outputs_)
+        A = self.params_["leaf_A"] * (self.y_std_[:, None] / self.x_std_[None, :])
+        for j in jumps:
+            out = np.maximum(out, np.linalg.norm(A[j["left"]] - A[j["right"]], axis=1))
+        if self.smoothness_ == 1:
+            out[self.hinge_["outputs"]] = 0.0
+        return out
+
     def _refit_leaves(self, Xs, ys, Js, leaves, cont=None, facets=None,
-                      theta_cont=None):
+                      theta_cont=None, fitted_cont=None):
         """Least-squares leaf refit on a frozen crisp partition (standardized).
 
         Returns new ``(leaf_mu, leaf_A, leaf_chol_raw)``. Coefficients are
@@ -592,7 +693,10 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         a multiple of ``W_i x + b_i``, i.e. ``N_i^T (theta_l - theta_r) = 0``
         with ``N_i`` spanning the complement of ``[b_i; W_i]``. Passing
         ``theta_cont`` ((n_leaves, q, n_cont)) instead fixes the continuous
-        outputs' leaf parameters (the tied-split hinge fit).
+        outputs' leaf parameters (the tied-split hinge fit), and
+        ``fitted_cont`` ((n, n_cont), optional) replaces their leaf-model
+        predictions when computing the residuals for the noise covariances
+        (the C1 model, which differs from the leaf models inside its bands).
         """
         p = self.params_
         n_lvs, d_y, n_feat = p["leaf_A"].shape
@@ -641,7 +745,10 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
             idx = np.flatnonzero(leaves == l)
             if idx.size == 0:
                 continue
-            resid = ys[idx] - (mu[l][None, :] + Xs[idx] @ A[l].T)
+            pred = mu[l][None, :] + Xs[idx] @ A[l].T
+            if fitted_cont is not None:
+                pred[:, cont] = fitted_cont[idx]
+            resid = ys[idx] - pred
             S = (resid.T @ resid + nu * Sigma_prev[l]) / (idx.size + nu)
             raw[l] = _chol_to_raw(np.linalg.cholesky(S))
         return mu, A, raw
@@ -765,6 +872,9 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         Xs = np.asarray(Xs, dtype=np.float64)
         leaves = self.apply_std(Xs)
         mean = p["leaf_mu"][leaves] + np.einsum("nyp,np->ny", p["leaf_A"][leaves], Xs)
+        if getattr(self, "smoothness_", 0) == 1:
+            h = self.hinge_
+            mean[:, h["outputs"]] = _hinge.smooth_predict(Xs, h["W"], h["b"], h["eps"], h["coef"])
         L = np.asarray(_model.build_chol(
             jnp.asarray(p["leaf_chol_raw"]), jnp.asarray(p["log_alpha"])
         ), dtype=np.float64)
@@ -840,6 +950,33 @@ class DifferentiableTreeRegressor(RegressorMixin, BaseEstimator):
         D = self.y_std_
         cov_o = np.asarray(total) * (D[:, None] * D[None, :])
         return self._shape_y_out(mean_o), cov_o
+
+    def predict_jacobian(self, X, hard: bool = False):
+        """Jacobian of the predicted mean with respect to x, in original units.
+
+        Returns ``(n, d_y, p)``, or ``(n, p)`` if the model was fitted with 1D
+        y. ``hard=False`` differentiates the soft mixture mean. ``hard=True``
+        gives the crisp model's gradient: the leaf slopes ``A_l`` (constant on
+        each leaf, undefined on the split boundaries themselves), or the
+        continuous gradient of a ``smoothness=1`` model.
+        """
+        check_is_fitted(self, "params_")
+        Xs = self._standardize_x_np(X)
+        if hard:
+            J = self.params_["leaf_A"][self.apply_std(Xs)].copy()
+            if getattr(self, "smoothness_", 0) == 1:
+                h = self.hinge_
+                J[:, h["outputs"]] = _hinge.smooth_jacobian(Xs, h["W"], h["b"], h["eps"], h["coef"])
+        else:
+            p = self._params_jax()
+            args = _reg_args(p)
+
+            def mean(x):
+                return _model.regressor_predict_moments(x, *args)[0]
+
+            J = np.asarray(jax.vmap(jax.jacfwd(mean))(jnp.asarray(Xs)), dtype=np.float64)
+        J = J * (self.y_std_[None, :, None] / self.x_std_[None, None, :])
+        return J[:, 0, :] if self.y_was_1d_ else J
 
     # ------------------------------------------------------------------ sample
 

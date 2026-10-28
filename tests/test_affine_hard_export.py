@@ -161,7 +161,8 @@ def test_hardening_recovers_linear_truth_exactly():
 def test_hardening_report(hardened, pwl_data):
     X, Y, X_te, Y_te = pwl_data
     rep = hardened.hardening_report_
-    assert set(rep) == {"before", "after", "n_validation", "continuous", "max_boundary_jump"}
+    assert set(rep) == {"before", "after", "n_validation", "continuous", "max_boundary_jump",
+                        "max_gradient_jump", "smoothness"}
     assert rep["continuous"] == []
     keys = {"rmse_soft", "rmse_hard", "rmse_gap", "r2_soft", "r2_hard",
             "nll_soft", "nll_hard", "mean_max_leaf_prob", "routing_agreement"}
